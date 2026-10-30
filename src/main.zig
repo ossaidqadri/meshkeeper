@@ -60,16 +60,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var settings = try loadSettings(arena, init.gpa, io, config_name);
+    // Settings live in their own arena, replaced whole on every reload, so a
+    // long-running daemon doesn't grow with each Wi-Fi reload or retry.
+    var settings_arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer settings_arena.deinit();
+    var settings = try loadSettings(settings_arena.allocator(), init.gpa, io, config_name);
     const sock = try PacketSocket.open(io, settings.interface);
     defer sock.close();
 
+    var first_mid: u16 = undefined;
+    io.random(std.mem.asBytes(&first_mid));
     var ctl: Controller = .init(.{
         .al_mac = sock.mac,
         .fronthaul = settings.fronthaul,
         .auto_wps = settings.auto_wps and !observe,
-    }, undefined);
-    io.random(std.mem.asBytes(&ctl.next_mid));
+    }, first_mid);
     loadState(init.gpa, io, &ctl);
 
     log.info("controller {x} on {s}{s}, auto-WPS {s}", .{ sock.mac, settings.interface, if (observe) " (observe only)" else "", if (ctl.cfg.auto_wps) "on" else "off" });
@@ -87,11 +92,16 @@ pub fn main(init: std.process.Init) !void {
         const now = Io.Clock.awake.now(io).toMilliseconds();
 
         if (probes.child == null and now >= resubscribe_at) {
-            settings = loadSettings(arena, init.gpa, io, config_name) catch |err| blk: {
+            var fresh: std.heap.ArenaAllocator = .init(init.gpa);
+            if (loadSettings(fresh.allocator(), init.gpa, io, config_name)) |s| {
+                settings_arena.deinit();
+                settings_arena = fresh;
+                settings = s;
+                ctl.cfg.fronthaul = settings.fronthaul;
+            } else |err| {
+                fresh.deinit();
                 log.warn("reloading settings failed ({t}), keeping the old ones", .{err});
-                break :blk settings;
-            };
-            ctl.cfg.fronthaul = settings.fronthaul;
+            }
             probes.start(init.gpa, io, settings.hostapd_objects) catch |err| {
                 log.warn("hostapd subscription failed ({t})", .{err});
                 resubscribe_at = now + resubscribe_after_ms;
