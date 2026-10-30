@@ -13,7 +13,8 @@ const Allocator = std.mem.Allocator;
 const cmdu = @import("cmdu.zig");
 const wsc = @import("wsc.zig");
 const uci = @import("uci.zig");
-const Controller = @import("controller.zig").Controller;
+const controller = @import("controller.zig");
+const Controller = controller.Controller;
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -60,6 +61,10 @@ const usage =
 
 const state_dir = "/etc/meshkeeper";
 const state_path = state_dir ++ "/state";
+/// RAM (tmpfs), read by the LuCI status page; rewritten often, so never flash.
+const mesh_dir = "/var/run/meshkeeper";
+const mesh_path = mesh_dir ++ "/mesh.json";
+const mesh_every_ms = 5 * std.time.ms_per_s;
 const resubscribe_after_ms = 5 * std.time.ms_per_s;
 const packet_outgoing = 4; // linux/if_packet.h PACKET_OUTGOING
 
@@ -120,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     var probes: ProbeFeed = .{};
     defer probes.stop(io);
     var resubscribe_at: i64 = 0;
+    var mesh_at: i64 = 0;
 
     var rx: [cmdu.max_frame]u8 = undefined;
     var tx: [cmdu.max_frame]u8 = undefined;
@@ -181,7 +187,22 @@ pub fn main(init: std.process.Init) !void {
             if (!observe) saveState(io, &ctl) catch |err| log.warn("saving {s} failed: {t}", .{ state_path, err });
             ctl.dirty = false;
         }
+
+        if (now >= mesh_at) {
+            mesh_at = now + mesh_every_ms;
+            writeMesh(io, &ctl, now) catch |err| log.warn("writing {s} failed: {t}", .{ mesh_path, err });
+        }
     }
+}
+
+fn writeMesh(io: Io, ctl: *const Controller, now: i64) !void {
+    var buf: [32 * 1024]u8 = undefined; // full tables: 4 agents x 32 clients is ~19 KB
+    var w: Io.Writer = .fixed(&buf);
+    try ctl.writeMesh(&w, now);
+    const cwd = Io.Dir.cwd();
+    try cwd.createDirPath(io, mesh_dir);
+    try cwd.writeFile(io, .{ .sub_path = mesh_path ++ ".tmp", .data = w.buffered() });
+    try cwd.rename(mesh_path ++ ".tmp", cwd, mesh_path, io);
 }
 
 fn send(sock: PacketSocket, observe: bool, frame: []const u8) void {
@@ -322,11 +343,9 @@ const ProbeFeed = struct {
     }
 };
 
-fn openWps(gpa: Allocator, io: Io, s: Settings, w: @import("controller.zig").WpsAction) void {
-    var mac_buf: [17]u8 = undefined;
-    const mac = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ w.stale_station[0], w.stale_station[1], w.stale_station[2], w.stale_station[3], w.stale_station[4], w.stale_station[5] }) catch unreachable;
+fn openWps(gpa: Allocator, io: Io, s: Settings, w: controller.WpsAction) void {
     var arg_buf: [128]u8 = undefined;
-    const del = std.fmt.bufPrint(&arg_buf, "{{\"addr\":\"{s}\",\"reason\":3,\"deauth\":true,\"ban_time\":0}}", .{mac}) catch unreachable;
+    const del = std.fmt.bufPrint(&arg_buf, "{{\"addr\":\"{s}\",\"reason\":3,\"deauth\":true,\"ban_time\":0}}", .{&controller.macText(w.stale_station)}) catch unreachable;
     for (s.hostapd_objects) |obj| _ = ubus(gpa, io, &.{ "call", obj, "del_client", del }) catch {};
     const obj = s.wps_object orelse {
         log.warn("no WPS-enabled fronthaul found, cannot open a window", .{});

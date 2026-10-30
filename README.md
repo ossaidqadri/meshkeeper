@@ -96,6 +96,18 @@ To keep it across firmware upgrades, add these to `/etc/sysupgrade.conf`:
 
 `logread -e meshkeeper` shows what it's doing.
 
+Optional, if you use LuCI: a Status, Mesh page that lists every wireless device, which router it's on and how well that router hears it, refreshed every 5 seconds. Handy while you find a spot for the satellite.
+
+```
+ssh root@192.168.1.1 'mkdir -p /www/luci-static/resources/view/meshkeeper'
+scp -O files/www/luci-static/resources/view/meshkeeper/mesh.js root@192.168.1.1:/www/luci-static/resources/view/meshkeeper/mesh.js
+scp -O files/usr/share/luci/menu.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/luci/menu.d/luci-app-meshkeeper.json
+scp -O files/usr/share/rpcd/acl.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/rpcd/acl.d/luci-app-meshkeeper.json
+ssh root@192.168.1.1 'rm -f /tmp/luci-indexcache* && /etc/init.d/rpcd reload'
+```
+
+Add those three files to `/etc/sysupgrade.conf` too.
+
 ### 3. Pair the satellite once
 
 Put the satellite in EasyMesh satellite mode using its own web page (on the AX12: Advanced, EasyMesh, Change Mode, Satellite Router). After it reboots, open WPS on the router's 5 GHz network (`ubus call hostapd.phy0-ap0 wps_start`, your interface name may differ) and short press WPS on the satellite. Within a minute or two meshkeeper pushes your network names, with the suffix you configured. Each radio's first push restarts the satellite's Wi-Fi, so expect up to two more WPS presses on the satellite during first setup. With auto-WPS on, the router side opens by itself.

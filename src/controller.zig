@@ -485,6 +485,44 @@ pub const Controller = struct {
         return .{ .stale_station = a.probing_iface, .agent = a.al_mac, .window = a.outage.windows };
     }
 
+    /// Live mesh view for the status page: each agent, whether it is talking,
+    /// and its clients with the signal the agent hears from them.
+    pub fn writeMesh(c: *const Controller, w: *std.Io.Writer, now: Ms) std.Io.Writer.Error!void {
+        var s: std.json.Stringify = .{ .writer = w };
+        try s.beginObject();
+        try s.objectField("agents");
+        try s.beginArray();
+        for (c.agents[0..c.n_agents]) |a| {
+            try s.beginObject();
+            try s.objectField("mac");
+            try s.write(macText(a.al_mac));
+            try s.objectField("online");
+            try s.write(!a.silent(now));
+            try s.objectField("heard_s_ago");
+            try s.write(secondsAgo(a.last_heard, now));
+            try s.objectField("steering");
+            try s.write(if (a.caps) |caps| caps.agent_rssi_steering else null);
+            try s.objectField("ifaces");
+            try s.beginArray();
+            for (a.ifaces[0..a.n_ifaces]) |m| try s.write(macText(m));
+            try s.endArray();
+            try s.objectField("clients");
+            try s.beginArray();
+            for (a.clients[0..a.n_clients]) |cl| try s.write(.{
+                .mac = macText(cl.mac),
+                .bssid = macText(cl.bssid),
+                .rssi = cl.rssi,
+                .down_mbps = cl.downlink_mbps,
+                .up_mbps = cl.uplink_mbps,
+                .metrics_s_ago = secondsAgo(cl.metrics_at, now),
+            });
+            try s.endArray();
+            try s.endObject();
+        }
+        try s.endArray();
+        try s.endObject();
+    }
+
     /// Persists what was learned (agents, their interfaces, radio bands and
     /// applied credential digests) as one line per agent.
     pub fn save(c: *const Controller, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -532,6 +570,18 @@ pub const Controller = struct {
         }
     }
 };
+
+/// "aa:bb:cc:dd:ee:ff"
+pub fn macText(m: Mac) [17]u8 {
+    const hex = std.fmt.bytesToHex(m, .lower);
+    var out: [17]u8 = @splat(':');
+    for (0..6) |i| out[i * 3 ..][0..2].* = hex[i * 2 ..][0..2].*;
+    return out;
+}
+
+fn secondsAgo(t: ?Ms, now: Ms) ?i64 {
+    return @divTrunc(now - (t orelse return null), std.time.ms_per_s);
+}
 
 fn parseMac(hex: []const u8) !Mac {
     var m: Mac = undefined;
@@ -765,6 +815,29 @@ test "mesh view: clients from topology and events, capabilities, rotating link m
     _ = try c.onFrame(try frameFrom(&in, .assoc_sta_link_metrics_response, &.{.{ .type = .associated_sta_link_metrics, .value = &lm }}), 6, &out, testSecrets());
     try testing.expectEqual(@as(?i8, -60), a.client(phone).?.rssi);
     try testing.expectEqual(400, a.client(phone).?.downlink_mbps);
+
+    // The status page's JSON, 7 s later.
+    var json: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&json);
+    try c.writeMesh(&w, 7 * std.time.ms_per_s);
+    const View = struct { agents: []const struct {
+        mac: []const u8,
+        online: bool,
+        steering: ?bool,
+        ifaces: []const []const u8,
+        clients: []const struct { mac: []const u8, rssi: ?i8, down_mbps: u32, metrics_s_ago: ?i64 },
+    } };
+    const v = try std.json.parseFromSlice(View, testing.allocator, w.buffered(), .{ .ignore_unknown_fields = true });
+    defer v.deinit();
+    const ag = v.value.agents[0];
+    try testing.expectEqualStrings("02:00:00:a0:d9:50", ag.mac);
+    try testing.expect(ag.online);
+    try testing.expectEqual(false, ag.steering.?);
+    try testing.expectEqualStrings("06:00:00:a0:d9:4f", ag.ifaces[0]);
+    try testing.expectEqualStrings("02:00:00:00:00:a1", ag.clients[0].mac);
+    try testing.expectEqual(@as(?i8, -60), ag.clients[0].rssi);
+    try testing.expectEqual(400, ag.clients[0].down_mbps);
+    try testing.expectEqual(@as(?i64, 6), ag.clients[0].metrics_s_ago);
 }
 
 test "state survives a save/load round trip" {

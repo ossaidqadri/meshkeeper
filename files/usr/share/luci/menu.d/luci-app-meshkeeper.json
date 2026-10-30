@@ -1,0 +1,13 @@
+{
+	"admin/status/mesh": {
+		"title": "Mesh",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "meshkeeper/mesh"
+		},
+		"depends": {
+			"acl": [ "luci-app-meshkeeper" ]
+		}
+	}
+}

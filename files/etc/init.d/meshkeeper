@@ -5,6 +5,7 @@ USE_PROCD=1
 
 PROG=/usr/sbin/meshkeeper
 STATE_DIR=/etc/meshkeeper
+MESH_DIR=/var/run/meshkeeper
 
 start_service() {
 	# Unprivileged account; the ubus ACL in /usr/share/acl.d grants it only the calls it makes.
@@ -13,8 +14,8 @@ start_service() {
 		user_add meshkeeper "" "$(group_add_next meshkeeper)" meshkeeper "$STATE_DIR"
 		kill -HUP "$(pidof ubusd)"
 	}
-	mkdir -p "$STATE_DIR"
-	chown -R meshkeeper:meshkeeper "$STATE_DIR"
+	mkdir -p "$STATE_DIR" "$MESH_DIR"
+	chown -R meshkeeper:meshkeeper "$STATE_DIR" "$MESH_DIR"
 
 	procd_open_instance
 	procd_set_param command "$PROG"
@@ -27,7 +28,7 @@ start_service() {
 		# file mount would keep showing the old one. Root-only configs stay
 		# unreadable to the service user.
 		procd_add_jail_mount /bin/ubus /etc/config
-		procd_add_jail_mount_rw "$STATE_DIR"
+		procd_add_jail_mount_rw "$STATE_DIR" "$MESH_DIR"
 		procd_set_param capabilities /etc/capabilities/meshkeeper.json
 		procd_set_param user meshkeeper
 		procd_set_param group meshkeeper

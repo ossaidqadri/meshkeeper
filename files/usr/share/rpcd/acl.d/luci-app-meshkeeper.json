@@ -1,0 +1,14 @@
+{
+	"luci-app-meshkeeper": {
+		"description": "Grant access to the meshkeeper mesh view",
+		"read": {
+			"file": {
+				"/var/run/meshkeeper/mesh.json": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "read" ],
+				"iwinfo": [ "assoclist" ]
+			}
+		}
+	}
+}
