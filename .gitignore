@@ -4,3 +4,4 @@ __pycache__/
 zig-out/
 .zig-cache/
 HANDOFF.md
+CLAUDE.md
