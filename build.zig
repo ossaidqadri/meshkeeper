@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
         .strip = optimize != .debug,
     });
 
-    const exe = b.addExecutable(.{ .name = "multiap-ctl", .root_module = mod });
+    const exe = b.addExecutable(.{ .name = "meshkeeper", .root_module = mod });
     b.installArtifact(exe);
 
     const tests = b.addTest(.{ .root_module = b.createModule(.{

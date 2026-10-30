@@ -233,11 +233,11 @@ fn writeM2Body(w: *Io.Writer, m1: M1, bss: Bss, uuid: *const [16]u8, public_key:
     try putAttr(w, .conn_type_flags, &.{0x01});
     try putAttrInt(w, .config_methods, @as(u16, 0x0080));
     try putAttr(w, .manufacturer, "OpenWrt");
-    try putAttr(w, .model_name, "multiap-ctl");
+    try putAttr(w, .model_name, "meshkeeper");
     try putAttr(w, .model_number, "1");
     try putAttr(w, .serial_number, "1");
     try putAttr(w, .primary_dev_type, &.{ 0x00, 0x06, 0x00, 0x50, 0xf2, 0x04, 0x00, 0x01 });
-    try putAttr(w, .dev_name, "multiap-ctl");
+    try putAttr(w, .dev_name, "meshkeeper");
     try putAttr(w, .rf_bands, &.{m1.rf_bands});
     try putAttrInt(w, .assoc_state, @as(u16, 0));
     try putAttrInt(w, .config_error, @as(u16, 0));

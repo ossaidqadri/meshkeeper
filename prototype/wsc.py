@@ -178,7 +178,7 @@ def build_m2(
     m1: M1,
     bss: BssConfig,
     registrar_uuid: bytes,
-    device_name: str = "multiap-ctl",
+    device_name: str = "meshkeeper",
     *,
     priv: int | None = None,
     registrar_nonce: bytes | None = None,
@@ -205,7 +205,7 @@ def build_m2(
         + attr(ATTR_CONN_TYPE_FLAGS, b"\x01")
         + attr(ATTR_CONFIG_METHODS, struct.pack(">H", 0x0080))
         + attr(ATTR_MANUFACTURER, b"OpenWrt")
-        + attr(ATTR_MODEL_NAME, b"multiap-ctl")
+        + attr(ATTR_MODEL_NAME, b"meshkeeper")
         + attr(ATTR_MODEL_NUMBER, b"1")
         + attr(ATTR_SERIAL_NUMBER, b"1")
         + attr(ATTR_PRIMARY_DEV_TYPE, bytes.fromhex("0006 0050f204 0001".replace(" ", "")))

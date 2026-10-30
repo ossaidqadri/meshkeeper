@@ -1,4 +1,4 @@
-//! multiap-ctl: a minimal EasyMesh (Multi-AP) controller for OpenWrt.
+//! meshkeeper: a minimal EasyMesh (Multi-AP) controller for OpenWrt.
 //!
 //! Wiring only: OpenWrt config over ubus, an AF_PACKET socket for IEEE 1905
 //! frames, hostapd probe events for the auto-WPS gate, and a poll loop that
@@ -17,13 +17,13 @@ pub const std_options: std.Options = .{ .log_level = .info };
 const log = std.log.scoped(.main);
 
 const usage =
-    \\usage: multiap-ctl [--observe] [--config NAME]
+    \\usage: meshkeeper [--observe] [--config NAME]
     \\  --observe      decode and log, never send frames or open WPS
-    \\  --config NAME  UCI config to read (default: multiap-ctl)
+    \\  --config NAME  UCI config to read (default: meshkeeper)
     \\
 ;
 
-const state_dir = "/etc/multiap-ctl";
+const state_dir = "/etc/meshkeeper";
 const state_path = state_dir ++ "/state";
 const resubscribe_after_ms = 5 * std.time.ms_per_s;
 const packet_outgoing = 4; // linux/if_packet.h PACKET_OUTGOING
@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var observe = false;
-    var config_name: []const u8 = "multiap-ctl";
+    var config_name: []const u8 = "meshkeeper";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--observe")) {
