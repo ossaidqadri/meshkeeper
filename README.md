@@ -6,7 +6,7 @@ One static binary, about 780 KB, about 1 MB of RAM. Written in Zig, no runtime d
 
 ## Why
 
-I moved my main router to OpenWrt (Archer C6 v2) and wanted to keep my old TP-Link AX12 as a wireless satellite. The AX12 has no OpenWrt port, but its stock firmware speaks EasyMesh. OpenWrt can onboard it over WPS, but there's no controller, so the satellite keeps broadcasting its factory network names and never gets yours. The full open-source controllers (prplMesh, iopsys mapcontroller) are far too big for a router with 3 MB of free flash. meshkeeper does just the part a home setup needs.
+My main router used to be a TP-Link Archer AX12. I wanted OpenWrt running the network, and the AX12 has no OpenWrt port, so my older Archer C6 v2 took over as the main router and the AX12 moved to satellite duty over Wi-Fi. Its stock firmware speaks EasyMesh. OpenWrt can onboard it over WPS, but there's no controller, so the satellite keeps broadcasting its factory network names and never gets yours. The full open-source controllers (prplMesh, iopsys mapcontroller) are far too big for a router with 3 MB of free flash. meshkeeper does just the part a home setup needs.
 
 ## What we ran into, and how it's handled
 
