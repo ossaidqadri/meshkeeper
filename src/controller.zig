@@ -29,7 +29,7 @@ pub const Ms = i64;
 
 pub const timing = struct {
     pub const query_interval: Ms = 5 * std.time.ms_per_min;
-    pub const query_retry: Ms = 2 * std.time.ms_per_s;
+    pub const query_retry: Ms = 30 * std.time.ms_per_s;
     pub const agent_silent_after: Ms = 60 * std.time.ms_per_s;
     pub const probe_recent: Ms = 30 * std.time.ms_per_s;
     pub const probe_before_wps: Ms = 60 * std.time.ms_per_s;
@@ -174,7 +174,14 @@ pub const Controller = struct {
     pub fn onFrame(c: *Controller, f: cmdu.Frame, now: Ms, out: []u8, secrets: wsc.Secrets) !?[]const u8 {
         if (std.mem.eql(u8, &f.src, &c.cfg.al_mac)) return null;
         const al_mac: Mac = if (f.find(.al_mac)) |v| (if (v.len == 6) v[0..6].* else return null) else f.src;
-        const a = c.agentOrNew(al_mac) orelse return null;
+        // Only messages an agent sends about itself may create one. A TP-Link
+        // backhaul STA also emits zero-filled 0x893a frames that parse as empty
+        // CMDUs; those must not turn its radio MAC into a phantom agent.
+        const introduces = switch (f.msg_type) {
+            .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc => true,
+            else => false,
+        };
+        const a = (if (introduces and f.tlv_bytes.len > 0) c.agentOrNew(al_mac) else c.agent(al_mac)) orelse return null;
         if (a.outage.windows > 0 or a.outage.first_probe != null) log.info("agent {x} is back", .{al_mac});
         a.last_heard = now;
         a.outage = .{};
@@ -573,6 +580,33 @@ test "auto-WPS stays shut when disabled, for unknown stations, and while the age
         c.onProbe(stranger, now);
         try testing.expectEqual(null, (try c.tick(now, &out)).wps);
     }
+}
+
+test "zero-filled 0x893a frames from a backhaul STA create no agent" {
+    var c = testController(false);
+    var out: [cmdu.max_frame]u8 = undefined;
+    // As captured on the C6: 9e:f1:..:4f -> radio MAC, ethertype 0x893a, all zeros.
+    var frame: [60]u8 = @splat(0);
+    frame[0..6].* = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x40 };
+    frame[6..12].* = ax12_bsta;
+    frame[12..14].* = .{ 0x89, 0x3a };
+    const f: cmdu.Frame = try .parse(&frame);
+    try testing.expectEqual(null, try c.onFrame(f, 0, &out, testSecrets()));
+    try testing.expectEqual(0, c.n_agents);
+}
+
+test "unanswered topology queries back off" {
+    var c = testController(false);
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    _ = try c.onFrame(try frameFrom(&in, .topology_query, &.{.{ .type = .multi_ap_profile, .value = &.{2} }}), 0, &out, testSecrets());
+    var sent: usize = 0;
+    var now: Ms = 0;
+    while (now < 55 * std.time.ms_per_s) : (now += std.time.ms_per_s) {
+        c.agent(ax12).?.last_heard = now; // agent keeps talking, never answers
+        if ((try c.tick(now, &out)).frame != null) sent += 1;
+    }
+    try testing.expectEqual(2, sent); // at 0 s and after the 30 s retry
 }
 
 test "state survives a save/load round trip" {

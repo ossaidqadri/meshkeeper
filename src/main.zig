@@ -132,7 +132,8 @@ pub fn main(init: std.process.Init) !void {
         if (t.wps) |w| openWps(init.gpa, io, settings, w);
 
         if (ctl.dirty) {
-            saveState(io, &ctl) catch |err| log.warn("saving {s} failed: {t}", .{ state_path, err });
+            // Observe mode has no side effects, flash writes included.
+            if (!observe) saveState(io, &ctl) catch |err| log.warn("saving {s} failed: {t}", .{ state_path, err });
             ctl.dirty = false;
         }
     }
