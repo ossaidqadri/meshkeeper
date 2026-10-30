@@ -118,11 +118,13 @@ config controller 'main'
 	option auto_wps '1'
 ```
 
+Set `fronthaul_2g` and `fronthaul_5g` to your own wireless section names. A fresh OpenWrt usually has `default_radio0` and `default_radio1`, and `uci show wireless | grep =wifi-iface` lists yours. With a wrong name it logs "wireless section not found" and pushes nothing.
+
 Run `meshkeeper --observe` to watch the traffic without sending anything, opening WPS or writing to flash.
 
 ## Security
 
-It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. The ubus ACL lets it read UCI, read the wireless status and call three hostapd methods (`notify_response`, `del_client`, `wps_start`), nothing else. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
+It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. The ubus ACL lets it read UCI, read the wireless status and call three hostapd methods (`notify_response`, `del_client`, `wps_start`), nothing else. One thing to know: ubus ACLs work per method, not per config, so "read UCI" means all of it, your WAN login included. It only needs its own config and `wireless`; reading those two files directly instead is on the list. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
 
 The honest trade-off is auto-WPS. Its trigger is a probe request from the satellite's backhaul MAC, and anyone nearby can fake a MAC. On its own that isn't enough: the real satellite also has to stop talking on the LAN for a minute, which takes a power cut or jamming. But if someone pulls that off, the router opens WPS and any device that presses its own WPS button inside those 2 minutes joins your Wi-Fi, which means LAN access. If that's not a risk you want, set `auto_wps '0'` and open WPS by hand after a power cut.
 
