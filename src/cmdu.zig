@@ -25,6 +25,11 @@ pub const MsgType = enum(u16) {
     ap_autoconfig_response = 0x0008,
     ap_autoconfig_wsc = 0x0009,
     ap_autoconfig_renew = 0x000A,
+    ack = 0x8000,
+    ap_capability_query = 0x8001,
+    ap_capability_report = 0x8002,
+    assoc_sta_link_metrics_query = 0x800D,
+    assoc_sta_link_metrics_response = 0x800E,
     _,
 };
 
@@ -41,7 +46,13 @@ pub const Tlv = enum(u8) {
     searched_service = 0x81,
     ap_radio_identifier = 0x82,
     ap_operational_bss = 0x83,
+    associated_clients = 0x84,
     ap_radio_basic_caps = 0x85,
+    client_association_event = 0x92,
+    sta_mac_address = 0x95,
+    associated_sta_link_metrics = 0x96,
+    ap_capability = 0xA1,
+    error_code = 0xA3,
     multi_ap_profile = 0xB3,
     _,
 };
@@ -191,7 +202,118 @@ pub const OperationalBss = struct {
     }
 };
 
+/// AP Capability TLV value (EasyMesh 17.2.6); bit 7 is the first flag.
+pub const ApCapability = packed struct(u8) {
+    _reserved: u5 = 0,
+    agent_rssi_steering: bool,
+    unassoc_metrics_off_channel: bool,
+    unassoc_metrics_on_channel: bool,
+};
+
+pub const ClientEntry = struct { bssid: Mac, mac: Mac, secs_since_assoc: u16 };
+
+/// Walks an Associated Clients TLV: per BSS its BSSID and clients, flattened.
+pub const AssociatedClients = struct {
+    r: Io.Reader,
+    bss_left: u8,
+    bssid: Mac = undefined,
+    clients_left: u16 = 0,
+
+    pub fn init(value: []const u8) ParseError!AssociatedClients {
+        var r: Io.Reader = .fixed(value);
+        const n = r.takeByte() catch return error.Truncated;
+        return .{ .r = r, .bss_left = n };
+    }
+
+    pub fn next(it: *AssociatedClients) ParseError!?ClientEntry {
+        while (it.clients_left == 0) {
+            if (it.bss_left == 0) return null;
+            it.bss_left -= 1;
+            it.bssid = (it.r.takeArray(6) catch return error.Truncated).*;
+            it.clients_left = it.r.takeInt(u16, .big) catch return error.Truncated;
+        }
+        it.clients_left -= 1;
+        const mac = (it.r.takeArray(6) catch return error.Truncated).*;
+        const secs = it.r.takeInt(u16, .big) catch return error.Truncated;
+        return .{ .bssid = it.bssid, .mac = mac, .secs_since_assoc = secs };
+    }
+};
+
+pub const LinkMetric = struct {
+    bssid: Mac,
+    age_ms: u32,
+    downlink_mbps: u32,
+    uplink_mbps: u32,
+    /// Uplink signal as the agent measured it, dBm; null when unavailable.
+    rssi: ?i8,
+};
+
+/// Associated STA Link Metrics TLV: the station, then one entry per BSS.
+pub const StaLinkMetrics = struct {
+    sta: Mac,
+    r: Io.Reader,
+    left: u8,
+
+    pub fn init(value: []const u8) ParseError!StaLinkMetrics {
+        var r: Io.Reader = .fixed(value);
+        const sta = (r.takeArray(6) catch return error.Truncated).*;
+        const n = r.takeByte() catch return error.Truncated;
+        return .{ .sta = sta, .r = r, .left = n };
+    }
+
+    pub fn next(it: *StaLinkMetrics) ParseError!?LinkMetric {
+        if (it.left == 0) return null;
+        it.left -= 1;
+        const bssid = (it.r.takeArray(6) catch return error.Truncated).*;
+        const age = it.r.takeInt(u32, .big) catch return error.Truncated;
+        const dl = it.r.takeInt(u32, .big) catch return error.Truncated;
+        const ul = it.r.takeInt(u32, .big) catch return error.Truncated;
+        const rcpi = it.r.takeByte() catch return error.Truncated;
+        return .{ .bssid = bssid, .age_ms = age, .downlink_mbps = dl, .uplink_mbps = ul, .rssi = rcpiToDbm(rcpi) };
+    }
+};
+
+/// IEEE 802.11 RCPI (0..220, half-dB steps from -110 dBm) to dBm.
+pub fn rcpiToDbm(rcpi: u8) ?i8 {
+    if (rcpi > 220) return null;
+    return @intCast(@as(i16, rcpi / 2) - 110);
+}
+
+/// Client Association Event TLV: client, BSSID, and whether it joined or left.
+pub const AssociationEvent = struct {
+    mac: Mac,
+    bssid: Mac,
+    joined: bool,
+
+    pub fn parse(value: []const u8) ParseError!AssociationEvent {
+        if (value.len < 13) return error.Truncated;
+        return .{ .mac = value[0..6].*, .bssid = value[6..12].*, .joined = value[12] & 0x80 != 0 };
+    }
+};
+
 const testing = std.testing;
+
+test "associated clients and link metrics walks" {
+    const ac = [_]u8{2} ++ [_]u8{ 1, 1, 1, 1, 1, 1, 0, 2 } ++ [_]u8{ 0xa, 0, 0, 0, 0, 1, 0, 5 } ++ [_]u8{ 0xa, 0, 0, 0, 0, 2, 0, 6 } ++
+        [_]u8{ 2, 2, 2, 2, 2, 2, 0, 1 } ++ [_]u8{ 0xb, 0, 0, 0, 0, 3, 1, 0 };
+    var it: AssociatedClients = try .init(&ac);
+    try testing.expectEqual(5, (try it.next()).?.secs_since_assoc);
+    try testing.expectEqual(6, (try it.next()).?.secs_since_assoc);
+    const third = (try it.next()).?;
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 2, 2, 2, 2 }, &third.bssid);
+    try testing.expectEqual(256, third.secs_since_assoc);
+    try testing.expectEqual(null, try it.next());
+
+    const lm = [_]u8{ 0xa, 0, 0, 0, 0, 1, 1 } ++ [_]u8{ 1, 1, 1, 1, 1, 1, 0, 0, 0, 10, 0, 0, 1, 0x90, 0, 0, 0, 0xc8, 100 };
+    var m: StaLinkMetrics = try .init(&lm);
+    const e = (try m.next()).?;
+    try testing.expectEqual(400, e.downlink_mbps);
+    try testing.expectEqual(200, e.uplink_mbps);
+    try testing.expectEqual(-60, e.rssi.?);
+    try testing.expectEqual(null, try m.next());
+    try testing.expectEqual(null, rcpiToDbm(255));
+    try testing.expectEqual(@as(?i8, -110), rcpiToDbm(0));
+}
 
 test "build then parse round-trips header and TLVs" {
     var buf: [max_frame]u8 = undefined;
@@ -247,12 +369,24 @@ test "fuzz: random and truncated frames never crash the parsers" {
         const f = Frame.parse(buf[0..len]) catch continue;
         var it = f.tlvs();
         while (it.next() catch unreachable) |e| {
-            if (e.type == .ap_operational_bss) {
-                var ob = OperationalBss.init(e.value) catch continue;
-                while (ob.nextRadio() catch null) |r| {
-                    var radio = r;
-                    while (radio.nextBss() catch null) |_| {}
-                }
+            switch (e.type) {
+                .ap_operational_bss => {
+                    var ob = OperationalBss.init(e.value) catch continue;
+                    while (ob.nextRadio() catch null) |r| {
+                        var radio = r;
+                        while (radio.nextBss() catch null) |_| {}
+                    }
+                },
+                .associated_clients => {
+                    var ac = AssociatedClients.init(e.value) catch continue;
+                    while (ac.next() catch null) |_| {}
+                },
+                .associated_sta_link_metrics => {
+                    var m = StaLinkMetrics.init(e.value) catch continue;
+                    while (m.next() catch null) |_| {}
+                },
+                .client_association_event => _ = AssociationEvent.parse(e.value) catch {},
+                else => {},
             }
         }
     }

@@ -23,6 +23,7 @@ pub const max_agents = 4;
 pub const max_ifaces = 8;
 pub const max_radios = 4;
 pub const max_ssids = 4;
+pub const max_clients = 32;
 
 /// Milliseconds on a monotonic clock.
 pub const Ms = i64;
@@ -36,6 +37,20 @@ pub const timing = struct {
     pub const wps_spacing: Ms = 150 * std.time.ms_per_s;
     pub const max_wps_per_outage = 3;
     pub const renew_spacing: Ms = 10 * std.time.ms_per_min;
+    pub const caps_retry: Ms = 60 * std.time.ms_per_s;
+    /// One associated-client metrics query per agent this often, round robin.
+    pub const metrics_interval: Ms = 10 * std.time.ms_per_s;
+};
+
+/// A Wi-Fi client of an agent, as the agent reports it.
+pub const Client = struct {
+    mac: Mac,
+    bssid: Mac,
+    /// Uplink signal as the agent hears it; null until a metrics report.
+    rssi: ?i8 = null,
+    downlink_mbps: u32 = 0,
+    uplink_mbps: u32 = 0,
+    metrics_at: ?Ms = null,
 };
 
 /// Credentials digest, so a password change is detected without storing it.
@@ -101,6 +116,14 @@ pub const Agent = struct {
     last_probe: ?Ms = null,
     probing_iface: Mac = undefined,
     outage: Outage = .{},
+    /// What the agent says it supports; null until it answers a capability query.
+    caps: ?cmdu.ApCapability = null,
+    last_caps_query: ?Ms = null,
+    clients: [max_clients]Client = undefined,
+    n_clients: u8 = 0,
+    next_metrics: u8 = 0,
+    last_metrics_query: ?Ms = null,
+    metrics_seen: bool = false,
 
     const Outage = struct {
         first_probe: ?Ms = null,
@@ -119,6 +142,31 @@ pub const Agent = struct {
     fn ownsIface(a: Agent, mac: Mac) bool {
         for (a.ifaces[0..a.n_ifaces]) |m| if (std.mem.eql(u8, &m, &mac)) return true;
         return false;
+    }
+
+    pub fn client(a: *Agent, mac: Mac) ?*Client {
+        for (a.clients[0..a.n_clients]) |*cl| if (std.mem.eql(u8, &cl.mac, &mac)) return cl;
+        return null;
+    }
+
+    fn addClient(a: *Agent, mac: Mac, bssid: Mac) void {
+        if (a.client(mac)) |cl| {
+            cl.bssid = bssid;
+            return;
+        }
+        if (a.n_clients == max_clients) return;
+        a.clients[a.n_clients] = .{ .mac = mac, .bssid = bssid };
+        a.n_clients += 1;
+        log.info("agent {x}: client {x} joined", .{ a.al_mac, mac });
+    }
+
+    fn removeClient(a: *Agent, mac: Mac) void {
+        for (a.clients[0..a.n_clients], 0..) |cl, i| if (std.mem.eql(u8, &cl.mac, &mac)) {
+            a.clients[i] = a.clients[a.n_clients - 1];
+            a.n_clients -= 1;
+            log.info("agent {x}: client {x} left", .{ a.al_mac, mac });
+            return;
+        };
     }
 
     fn silent(a: Agent, now: Ms) bool {
@@ -209,6 +257,26 @@ pub const Controller = struct {
             },
             .topology_response => {
                 try c.learnTopology(a, f, now);
+                try learnClients(a, f);
+                return null;
+            },
+            .topology_notification => {
+                if (f.find(.client_association_event)) |v| {
+                    const ev = try cmdu.AssociationEvent.parse(v);
+                    if (ev.joined) a.addClient(ev.mac, ev.bssid) else a.removeClient(ev.mac);
+                }
+                return null;
+            },
+            .ap_capability_report => {
+                const v = f.find(.ap_capability) orelse return null;
+                if (v.len < 1) return null;
+                const caps: cmdu.ApCapability = @bitCast(v[0]);
+                if (a.caps == null) log.info("agent {x} supports: unassociated client metrics on its channel {}, off channel {}, steering by itself {}", .{ a.al_mac, caps.unassoc_metrics_on_channel, caps.unassoc_metrics_off_channel, caps.agent_rssi_steering });
+                a.caps = caps;
+                return null;
+            },
+            .assoc_sta_link_metrics_response => {
+                learnLinkMetrics(a, f, now);
                 return null;
             },
             .ap_autoconfig_wsc => return c.answerM1(a, f, now, out, secrets),
@@ -230,6 +298,43 @@ pub const Controller = struct {
                 if (rad.n_ssids == max_ssids) continue;
                 rad.ssids[rad.n_ssids] = std.hash.Wyhash.hash(0, bss.ssid);
                 rad.n_ssids += 1;
+            }
+        }
+    }
+
+    /// The Associated Clients TLV is the full list: clients not in it have left.
+    fn learnClients(a: *Agent, f: cmdu.Frame) !void {
+        const v = f.find(.associated_clients) orelse return;
+        var seen: [max_clients]bool = @splat(false);
+        var it: cmdu.AssociatedClients = try .init(v);
+        while (try it.next()) |e| {
+            if (a.ownsIface(e.mac)) continue; // its own backhaul station
+            a.addClient(e.mac, e.bssid);
+            for (a.clients[0..a.n_clients], 0..) |cl, i| if (std.mem.eql(u8, &cl.mac, &e.mac)) {
+                seen[i] = true;
+            };
+        }
+        var i: usize = a.n_clients;
+        while (i > 0) {
+            i -= 1;
+            if (!seen[i]) a.removeClient(a.clients[i].mac);
+        }
+    }
+
+    fn learnLinkMetrics(a: *Agent, f: cmdu.Frame, now: Ms) void {
+        var it = f.tlvs();
+        while (it.next() catch unreachable) |e| {
+            if (e.type != .associated_sta_link_metrics) continue;
+            var m = cmdu.StaLinkMetrics.init(e.value) catch continue;
+            const cl = a.client(m.sta) orelse continue;
+            while (m.next() catch null) |lm| {
+                if (!std.mem.eql(u8, &lm.bssid, &cl.bssid)) continue;
+                cl.rssi = lm.rssi;
+                cl.downlink_mbps = lm.downlink_mbps;
+                cl.uplink_mbps = lm.uplink_mbps;
+                cl.metrics_at = now;
+                if (!a.metrics_seen) log.info("agent {x} reports link metrics: client {x} at {?d} dBm, {d}/{d} Mbit/s", .{ a.al_mac, cl.mac, cl.rssi, cl.downlink_mbps, cl.uplink_mbps });
+                a.metrics_seen = true;
             }
         }
     }
@@ -332,6 +437,19 @@ pub const Controller = struct {
                     .{ .type = .al_mac, .value = &c.cfg.al_mac },
                     .{ .type = .supported_role, .value = &.{cmdu.role_registrar} },
                     .{ .type = .supported_freq_band, .value = &.{freq} },
+                }) };
+            }
+            if (a.caps == null and (if (a.last_caps_query) |t| now - t > timing.caps_retry else true)) {
+                a.last_caps_query = now;
+                return .{ .frame = try cmdu.build(out, a.al_mac, c.cfg.al_mac, .ap_capability_query, c.mid(), &.{}) };
+            }
+            if (a.n_clients > 0 and (if (a.last_metrics_query) |t| now - t > timing.metrics_interval else true)) {
+                a.last_metrics_query = now;
+                if (a.next_metrics >= a.n_clients) a.next_metrics = 0;
+                const sta = a.clients[a.next_metrics].mac;
+                a.next_metrics += 1;
+                return .{ .frame = try cmdu.build(out, a.al_mac, c.cfg.al_mac, .assoc_sta_link_metrics_query, c.mid(), &.{
+                    .{ .type = .sta_mac_address, .value = &sta },
                 }) };
             }
         }
@@ -604,9 +722,49 @@ test "unanswered topology queries back off" {
     var now: Ms = 0;
     while (now < 55 * std.time.ms_per_s) : (now += std.time.ms_per_s) {
         c.agent(ax12).?.last_heard = now; // agent keeps talking, never answers
-        if ((try c.tick(now, &out)).frame != null) sent += 1;
+        if ((try c.tick(now, &out)).frame) |fr| {
+            if ((try cmdu.Frame.parse(fr)).msg_type == .topology_query) sent += 1;
+        }
     }
     try testing.expectEqual(2, sent); // at 0 s and after the 30 s retry
+}
+
+test "mesh view: clients from topology and events, capabilities, rotating link metrics" {
+    var c = testController(false);
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    _ = try c.onFrame(try topologyWithSsid(&in, "MK 5GHz Ext"), 0, &out, testSecrets());
+
+    const phone: Mac = .{ 0x02, 0, 0, 0, 0, 0xa1 };
+    const laptop: Mac = .{ 0x02, 0, 0, 0, 0, 0xa2 };
+    // Associated Clients: one BSS with the phone, the laptop and the agent's own backhaul STA.
+    const ac = [_]u8{1} ++ radio5 ++ [_]u8{ 0, 3 } ++ phone ++ [_]u8{ 0, 9 } ++ laptop ++ [_]u8{ 0, 9 } ++ ax12_bsta ++ [_]u8{ 0, 9 };
+    _ = try c.onFrame(try frameFrom(&in, .topology_response, &.{.{ .type = .associated_clients, .value = &ac }}), 1, &out, testSecrets());
+    const a = c.agent(ax12).?;
+    try testing.expectEqual(2, a.n_clients);
+
+    // The laptop leaves.
+    const left = laptop ++ radio5 ++ [_]u8{0};
+    _ = try c.onFrame(try frameFrom(&in, .topology_notification, &.{.{ .type = .client_association_event, .value = &left }}), 2, &out, testSecrets());
+    try testing.expectEqual(1, a.n_clients);
+    try testing.expect(a.client(phone) != null);
+
+    // Next ticks ask for capabilities, then for the phone's link metrics.
+    a.last_report = 2;
+    var t = try c.tick(3, &out);
+    try testing.expectEqual(cmdu.MsgType.ap_capability_query, (try cmdu.Frame.parse(t.frame.?)).msg_type);
+    _ = try c.onFrame(try frameFrom(&in, .ap_capability_report, &.{.{ .type = .ap_capability, .value = &.{0xc0} }}), 4, &out, testSecrets());
+    try testing.expect(a.caps.?.unassoc_metrics_on_channel);
+    try testing.expect(!a.caps.?.agent_rssi_steering);
+    t = try c.tick(5, &out);
+    const q: cmdu.Frame = try .parse(t.frame.?);
+    try testing.expectEqual(cmdu.MsgType.assoc_sta_link_metrics_query, q.msg_type);
+    try testing.expectEqualSlices(u8, &phone, q.find(.sta_mac_address).?);
+
+    const lm = phone ++ [_]u8{1} ++ radio5 ++ [_]u8{ 0, 0, 0, 10, 0, 0, 1, 0x90, 0, 0, 0, 0xc8, 100 };
+    _ = try c.onFrame(try frameFrom(&in, .assoc_sta_link_metrics_response, &.{.{ .type = .associated_sta_link_metrics, .value = &lm }}), 6, &out, testSecrets());
+    try testing.expectEqual(@as(?i8, -60), a.client(phone).?.rssi);
+    try testing.expectEqual(400, a.client(phone).?.downlink_mbps);
 }
 
 test "state survives a save/load round trip" {
@@ -636,7 +794,7 @@ test "fuzz: random frames from a known agent never crash the controller" {
     var in: [cmdu.max_frame]u8 = undefined;
     var out: [cmdu.max_frame]u8 = undefined;
     var tlv_buf: [300]u8 = undefined;
-    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific };
+    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific, .topology_notification, .ap_capability_report, .assoc_sta_link_metrics_response };
     for (0..5000) |i| {
         const n = rand.uintAtMost(usize, tlv_buf.len);
         rand.bytes(tlv_buf[0..n]);
