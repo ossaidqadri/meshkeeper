@@ -1,0 +1,15 @@
+{
+	"user": "multiap",
+	"access": {
+		"uci": {
+			"methods": [ "get" ]
+		},
+		"network.wireless": {
+			"methods": [ "status" ]
+		},
+		"hostapd.*": {
+			"methods": [ "notify_response", "del_client", "wps_start" ]
+		}
+	},
+	"subscribe": [ "hostapd.*" ]
+}
