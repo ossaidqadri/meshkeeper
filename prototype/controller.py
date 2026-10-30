@@ -102,6 +102,17 @@ def main() -> None:
                 ]
                 send(c.build_frame(sender, al_mac, c.MSG_AP_AUTOCONFIG_RESPONSE, f.mid, tlvs), f"autoconfig response, band {band}")
 
+            elif f.msg_type == c.MSG_TOPOLOGY_QUERY and args.respond:
+                # The agent checks who the controller is before sending M1.
+                # Device Information: our AL MAC with one wired interface, no neighbours.
+                device_info = al_mac + bytes([1]) + al_mac + c.MEDIA_IEEE_802_3AB.to_bytes(2, "big") + bytes([0])
+                tlvs = [
+                    (c.TLV_DEVICE_INFO, device_info),
+                    (c.TLV_SUPPORTED_SERVICE, bytes([1, c.SERVICE_CONTROLLER])),
+                    (c.TLV_MULTI_AP_PROFILE, bytes([1])),
+                ]
+                send(c.build_frame(f.src, al_mac, c.MSG_TOPOLOGY_RESPONSE, f.mid, tlvs), "topology response")
+
             elif f.msg_type == c.MSG_AP_AUTOCONFIG_WSC:
                 caps, m1raw = f.tlv(c.TLV_AP_RADIO_BASIC_CAPS), f.tlv(c.TLV_WSC)
                 if not caps or not m1raw:
