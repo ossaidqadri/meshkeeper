@@ -127,11 +127,13 @@ def main() -> None:
                       f"auth 0x{m1.auth_flags:04x}, encr 0x{m1.encr_flags:04x}", flush=True)
                 if not args.configure or m1.rf_bands not in bands:
                     continue
-                # Every M1 carries a fresh nonce and key, so each one gets its own M2;
-                # only throttle bursts so a retry storm can't flood the agent.
-                now = time.monotonic()
-                if now - last_m2.get(ruid, -10.0) < 3:
+                # A TP-Link agent restarts its Wi-Fi on every applied M2 and, after the
+                # re-pair that follows, sends M1 again. Answering that would loop, so
+                # each radio is configured once per run; rerun if an M2 got lost.
+                if ruid in last_m2:
+                    print("  radio already configured this run, not answering", flush=True)
                     continue
+                now = time.monotonic()
                 cfg = bss.get(m1.rf_bands)
                 if cfg is None:
                     print(f"  no SSID for rf_bands 0x{m1.rf_bands:02x}, not answering", flush=True)
