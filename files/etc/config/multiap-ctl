@@ -1,0 +1,12 @@
+
+config controller 'main'
+	# Bridge the agents' 1905 frames arrive on.
+	option interface 'br-lan'
+	# Wireless sections whose SSID and key the agents' 2.4 and 5 GHz radios copy.
+	option fronthaul_2g 'wifinet0'
+	option fronthaul_5g 'wifinet1'
+	# Appended to the copied SSIDs, e.g. ' Ext'; empty for one shared name.
+	option ssid_suffix ' Ext'
+	# Open the router's WPS window when a known satellite lost power and is
+	# searching (see README for the security trade-off).
+	option auto_wps '1'
