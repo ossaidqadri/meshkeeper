@@ -206,6 +206,9 @@ pub const Agent = struct {
     next_metrics: u8 = 0,
     last_metrics_query: ?Ms = null,
     metrics_seen: bool = false,
+    beacon_seen: bool = false,
+    /// Beacon queries sent since the last answer; 3 means it likely never answers.
+    beacon_unanswered: u8 = 0,
 
     const Outage = struct {
         first_probe: ?Ms = null,
@@ -617,10 +620,15 @@ pub const Controller = struct {
             if (now - measured > timing.reading_fresh or rssi >= agent_weak) continue;
             if (cl.beacon_query_at) |t| if (now - t < timing.beacon_interval) continue;
             if (c.recentlySteered(cl.mac, now)) continue;
-            const band = a.bandOf(cl.bssid) orelse continue;
-            const local = for (c.cfg.local) |l| (if (l.band == band) break l) else continue;
+            // 5 GHz only: there the agent's fronthaul shares the router's channel
+            // (its backhaul is a client of it), so one scan sees both BSSes. On
+            // 2.4 GHz the agent picks its own channel; probes cover that band.
+            if (a.bandOf(cl.bssid) != .@"5") continue;
+            const local = for (c.cfg.local) |l| (if (l.band == .@"5") break l) else continue;
             const op_class = cmdu.opClass20(local.channel) orelse continue;
             cl.beacon_query_at = now;
+            a.beacon_unanswered +|= 1;
+            if (a.beacon_unanswered == 3 and !a.beacon_seen) log.warn("agent {x} hasn't answered 3 beacon metrics queries; satellite clients will only be steered from probes", .{a.al_mac});
             const q = cmdu.beaconQuery(cl.mac, op_class, local.channel);
             return try cmdu.build(out, a.al_mac, c.cfg.al_mac, .beacon_metrics_query, c.mid(), &.{
                 .{ .type = .beacon_metrics_query, .value = &q },
@@ -631,6 +639,7 @@ pub const Controller = struct {
 
     fn learnBeacons(c: *Controller, a: *Agent, v: []const u8, now: Ms) void {
         var it = cmdu.BeaconReports.init(v) catch return;
+        a.beacon_unanswered = 0;
         const cl = a.client(it.sta) orelse return;
         var heard: ?Heard = null;
         var serving: ?i8 = null;
@@ -641,6 +650,8 @@ pub const Controller = struct {
                 heard = .{ .bss = @intCast(i), .rssi = rssi, .at = now };
             };
         }
+        if (!a.beacon_seen) log.info("agent {x} answers beacon metrics: client {x} hears router {?d} dBm, agent {?d} dBm", .{ a.al_mac, cl.mac, if (heard) |h| h.rssi else null, serving });
+        a.beacon_seen = true;
         var h = heard orelse return;
         h.serving = serving orelse return; // two readings the same way, or none
         // Debug: a weak client sitting still would log this every query.
