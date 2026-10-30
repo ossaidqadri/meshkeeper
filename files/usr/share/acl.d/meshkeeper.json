@@ -1,9 +1,6 @@
 {
 	"user": "meshkeeper",
 	"access": {
-		"uci": {
-			"methods": [ "get" ]
-		},
 		"network.wireless": {
 			"methods": [ "status" ]
 		},

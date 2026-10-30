@@ -40,7 +40,7 @@ TP-Link Archer C6 v2 (US) on OpenWrt 25.12.6 as the main router, TP-Link Archer 
 
 ## How it works
 
-It listens for IEEE 1905 frames on the LAN bridge with a raw socket, answers the satellite's controller search and topology queries, and answers its per-radio M1 with an M2 built from your router's own `wireless` config (WSC: DH group 5, HMAC-SHA256 key derivation, AES-128-CBC). It reads config and talks to hostapd over ubus, and watches hostapd probe events for the auto-WPS check. The decision logic is a pure state machine with no I/O, so all of it is unit tested on the host. What it learns (satellite interfaces, radio bands, credential hashes, never passwords) is saved to `/etc/meshkeeper/state` only when something changes.
+It listens for IEEE 1905 frames on the LAN bridge with a raw socket, answers the satellite's controller search and topology queries, and answers its per-radio M1 with an M2 built from your router's own `wireless` config (WSC: DH group 5, HMAC-SHA256 key derivation, AES-128-CBC). It reads its config files from `/etc/config`, talks to hostapd over ubus, and watches hostapd probe events for the auto-WPS check. The decision logic is a pure state machine with no I/O, so all of it is unit tested on the host. What it learns (satellite interfaces, radio bands, credential hashes, never passwords) is saved to `/etc/meshkeeper/state` only when something changes.
 
 ## Setup
 
@@ -118,13 +118,13 @@ config controller 'main'
 	option auto_wps '1'
 ```
 
-Set `fronthaul_2g` and `fronthaul_5g` to your own wireless section names. A fresh OpenWrt usually has `default_radio0` and `default_radio1`, and `uci show wireless | grep =wifi-iface` lists yours. With a wrong name it logs "wireless section not found" and pushes nothing.
+Set `fronthaul_2g` and `fronthaul_5g` to your own wireless section names. A fresh OpenWrt usually has `default_radio0` and `default_radio1`, and `uci show wireless | grep =wifi-iface` lists yours. With a wrong name it logs "wireless section not found" and pushes nothing. The sections need a name; an anonymous `config wifi-iface` can't be picked.
 
 Run `meshkeeper --observe` to watch the traffic without sending anything, opening WPS or writing to flash.
 
 ## Security
 
-It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. The ubus ACL lets it read UCI, read the wireless status and call three hostapd methods (`notify_response`, `del_client`, `wps_start`), nothing else. One thing to know: ubus ACLs work per method, not per config, so "read UCI" means all of it, your WAN login included. It only needs its own config and `wireless`; reading those two files directly instead is on the list. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
+It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. It reads its own config and `wireless` straight from `/etc/config` as that user, so the root-only configs (network with your WAN login, system, dhcp, uhttpd, rpcd, dropbear) stay out of its reach. `wireless` is readable by every user on stock OpenWrt anyway. Over ubus it can only read the wireless status and call three hostapd methods (`notify_response`, `del_client`, `wps_start`), nothing else. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
 
 The honest trade-off is auto-WPS. Its trigger is a probe request from the satellite's backhaul MAC, and anyone nearby can fake a MAC. On its own that isn't enough: the real satellite also has to stop talking on the LAN for a minute, which takes a power cut or jamming. But if someone pulls that off, the router opens WPS and any device that presses its own WPS button inside those 2 minutes joins your Wi-Fi, which means LAN access. If that's not a risk you want, set `auto_wps '0'` and open WPS by hand after a power cut.
 

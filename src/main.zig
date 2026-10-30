@@ -1,6 +1,6 @@
 //! meshkeeper: a minimal EasyMesh (Multi-AP) controller for OpenWrt.
 //!
-//! Wiring only: OpenWrt config over ubus, an AF_PACKET socket for IEEE 1905
+//! Wiring only: OpenWrt config files, ubus for wireless status and hostapd, an AF_PACKET socket for IEEE 1905
 //! frames, hostapd probe events for the auto-WPS gate, and a poll loop that
 //! feeds the pure `Controller`.
 
@@ -12,6 +12,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const cmdu = @import("cmdu.zig");
 const wsc = @import("wsc.zig");
+const uci = @import("uci.zig");
 const Controller = @import("controller.zig").Controller;
 
 pub const std_options: std.Options = .{
@@ -85,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--observe")) {
             observe = true;
-        } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len and std.mem.indexOfScalar(u8, args[i + 1], '/') == null) {
             i += 1;
             config_name = args[i];
         } else {
@@ -352,36 +353,27 @@ fn ubus(gpa: Allocator, io: Io, args: []const []const u8) ![]u8 {
 }
 
 fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u8) !Settings {
-    const UciSections = std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value));
-    const Uci = struct { values: UciSections };
+    const own = try readUci(arena, io, config_name);
+    const main_section = own.section("main") orelse return error.MissingMainSection;
+    const wifi = try readUci(arena, io, "wireless");
     const opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
-
-    var req_buf: [96]u8 = undefined;
-    const own_raw = try ubus(gpa, io, &.{ "call", "uci", "get", try std.fmt.bufPrint(&req_buf, "{{\"config\":\"{s}\"}}", .{config_name}) });
-    defer gpa.free(own_raw);
-    const own = try std.json.parseFromSliceLeaky(Uci, arena, own_raw, opts);
-    const main_section = own.values.map.get("main") orelse return error.MissingMainSection;
-
-    const wifi_raw = try ubus(gpa, io, &.{ "call", "uci", "get", "{\"config\":\"wireless\"}" });
-    defer gpa.free(wifi_raw);
-    const wifi = try std.json.parseFromSliceLeaky(Uci, arena, wifi_raw, opts);
 
     const status_raw = try ubus(gpa, io, &.{ "call", "network.wireless", "status" });
     defer gpa.free(status_raw);
     const Status = std.json.ArrayHashMap(struct { interfaces: []const struct { section: []const u8, ifname: ?[]const u8 = null } = &.{} });
     const status = try std.json.parseFromSliceLeaky(Status, arena, status_raw, opts);
 
-    const suffix = str(main_section, "ssid_suffix") orelse "";
+    const suffix = main_section.get("ssid_suffix") orelse "";
     var fronthaul: [2]?wsc.Bss = .{ null, null };
     var wps_object: ?[]const u8 = null;
     for ([_][]const u8{ "fronthaul_2g", "fronthaul_5g" }, 0..) |key, band| {
-        const section = str(main_section, key) orelse continue;
-        const iface = wifi.values.map.get(section) orelse {
+        const section = main_section.get(key) orelse continue;
+        const iface = wifi.section(section) orelse {
             log.warn("{s}: wireless section '{s}' not found", .{ key, section });
             continue;
         };
-        const ssid = str(iface, "ssid") orelse continue;
-        const passphrase = str(iface, "key") orelse continue;
+        const ssid = iface.get("ssid") orelse continue;
+        const passphrase = iface.get("key") orelse continue;
         if (passphrase.len < 8 or passphrase.len > 63) {
             log.warn("{s}: key must be an 8-63 character passphrase", .{section});
             continue;
@@ -399,9 +391,9 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
     };
 
     return .{
-        .interface = str(main_section, "interface") orelse "br-lan",
+        .interface = main_section.get("interface") orelse "br-lan",
         .fronthaul = fronthaul,
-        .auto_wps = std.mem.eql(u8, str(main_section, "auto_wps") orelse "0", "1"),
+        .auto_wps = std.mem.eql(u8, main_section.get("auto_wps") orelse "0", "1"),
         .wps_object = wps_object,
         .hostapd_objects = objects.items,
     };
@@ -416,10 +408,17 @@ fn hostapdObject(arena: Allocator, status: anytype, section: []const u8) !?[]con
     return null;
 }
 
-fn str(section: std.json.ArrayHashMap(std.json.Value), key: []const u8) ?[]const u8 {
-    return switch (section.map.get(key) orelse return null) {
-        .string => |s| s,
-        else => null,
+/// Reads /etc/config/<name> directly, as the service user: file permissions
+/// then keep root-only configs (network, system, ...) out of reach, which
+/// `ubus call uci get` would not.
+fn readUci(arena: Allocator, io: Io, name: []const u8) !uci.Config {
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/etc/config/{s}", .{name});
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(uci.max_file));
+    var diag: uci.Diagnostics = .{};
+    return uci.parse(arena, text, &diag) catch |err| {
+        log.warn("{s} line {d}: {t}", .{ path, diag.line, err });
+        return err;
     };
 }
 
@@ -451,4 +450,5 @@ test {
     _ = @import("cmdu.zig");
     _ = @import("wsc.zig");
     _ = @import("controller.zig");
+    _ = @import("uci.zig");
 }
