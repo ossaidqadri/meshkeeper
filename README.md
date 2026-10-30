@@ -103,10 +103,10 @@ ssh root@192.168.1.1 'mkdir -p /www/luci-static/resources/view/meshkeeper'
 scp -O files/www/luci-static/resources/view/meshkeeper/mesh.js root@192.168.1.1:/www/luci-static/resources/view/meshkeeper/mesh.js
 scp -O files/usr/share/luci/menu.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/luci/menu.d/luci-app-meshkeeper.json
 scp -O files/usr/share/rpcd/acl.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/rpcd/acl.d/luci-app-meshkeeper.json
-ssh root@192.168.1.1 'rm -f /tmp/luci-indexcache* && /etc/init.d/rpcd reload'
+ssh root@192.168.1.1 '/etc/init.d/rpcd reload'
 ```
 
-Add those three files to `/etc/sysupgrade.conf` too.
+Then log out of LuCI and back in, permissions are read at login. Add those three files to `/etc/sysupgrade.conf` too.
 
 ### 3. Pair the satellite once
 

@@ -8,7 +8,9 @@
 // Main router clients come from iwinfo; satellite clients from the file
 // meshkeeper rewrites every 5 s.
 
-const MESH_FILE = '/var/run/meshkeeper/mesh.json';
+// meshkeeper writes /var/run/meshkeeper/mesh.json, but /var is a symlink to
+// /tmp and rpcd only grants a file when request and ACL use the real path.
+const MESH_FILE = '/tmp/run/meshkeeper/mesh.json';
 
 function signalText(dbm) {
 	if (dbm == null)

@@ -3,7 +3,7 @@
 		"description": "Grant access to the meshkeeper mesh view",
 		"read": {
 			"file": {
-				"/var/run/meshkeeper/mesh.json": [ "read" ]
+				"/tmp/run/meshkeeper/mesh.json": [ "read" ]
 			},
 			"ubus": {
 				"file": [ "read" ],
