@@ -1,0 +1,7 @@
+.{
+    .name = .multiap_ctl,
+    .version = "0.1.0",
+    .fingerprint = 0x801607df4f914c14,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
