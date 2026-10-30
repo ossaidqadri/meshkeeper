@@ -32,6 +32,22 @@ TLV_SEARCHED_SERVICE = 0x81
 TLV_AP_RADIO_IDENTIFIER = 0x82
 TLV_AP_RADIO_BASIC_CAPS = 0x85
 TLV_MULTI_AP_PROFILE = 0xB3
+TLV_AP_OPERATIONAL_BSS = 0x83
+
+
+def parse_operational_bss(v: bytes) -> list[tuple[bytes, list[tuple[bytes, str]]]]:
+    """AP Operational BSS TLV: [(radio uid, [(bssid, ssid), ...]), ...]."""
+    out, i = [], 1
+    for _ in range(v[0]):
+        ruid, nbss = v[i : i + 6], v[i + 6]
+        i += 7
+        bsses = []
+        for _ in range(nbss):
+            bssid, slen = v[i : i + 6], v[i + 6]
+            bsses.append((bssid, v[i + 7 : i + 7 + slen].decode(errors="replace")))
+            i += 7 + slen
+        out.append((ruid, bsses))
+    return out
 
 ROLE_REGISTRAR = 0x00
 SERVICE_CONTROLLER = 0x00
