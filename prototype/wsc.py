@@ -174,13 +174,23 @@ def encrypted_settings(keys: Keys, bss: BssConfig, bssid: bytes, iv: bytes | Non
     return attr(ATTR_ENCR_SETTINGS, iv + enc.update(plain) + enc.finalize())
 
 
-def build_m2(m1: M1, bss: BssConfig, registrar_uuid: bytes, device_name: str = "multiap-ctl") -> bytes:
-    priv = int.from_bytes(os.urandom(DH_LEN), "big") % (DH_P - 2) + 1
+def build_m2(
+    m1: M1,
+    bss: BssConfig,
+    registrar_uuid: bytes,
+    device_name: str = "multiap-ctl",
+    *,
+    priv: int | None = None,
+    registrar_nonce: bytes | None = None,
+    iv: bytes | None = None,
+) -> bytes:
+    """priv, registrar_nonce and iv are random unless given (fixed values are for test vectors)."""
+    priv = priv or int.from_bytes(os.urandom(DH_LEN), "big") % (DH_P - 2) + 1
     pub = pow(DH_G, priv, DH_P).to_bytes(DH_LEN, "big")
     peer = int.from_bytes(m1.public_key, "big")
     if not 1 < peer < DH_P - 1:
         raise ValueError("M1 public key out of range")
-    registrar_nonce = os.urandom(16)
+    registrar_nonce = registrar_nonce or os.urandom(16)
     keys = derive_keys(pow(peer, priv, DH_P), m1.nonce, m1.mac, registrar_nonce)
 
     body = (
@@ -206,7 +216,7 @@ def build_m2(m1: M1, bss: BssConfig, registrar_uuid: bytes, device_name: str = "
         + attr(ATTR_DEV_PASSWORD_ID, b"\x00\x04")
         + attr(ATTR_OS_VERSION, struct.pack(">I", 0x80000000))
         + wfa_vendor_ext((WFA_ELEM_VERSION2, b"\x20"))
-        + encrypted_settings(keys, bss, m1.mac)
+        + encrypted_settings(keys, bss, m1.mac, iv)
     )
     authenticator = hmac.new(keys.auth_key, m1.raw + body, hashlib.sha256).digest()[:8]
     return body + attr(ATTR_AUTHENTICATOR, authenticator)
