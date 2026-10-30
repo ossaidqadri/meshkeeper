@@ -35,6 +35,9 @@ def load_bss(args) -> dict[int, wsc.BssConfig]:
         key = router(args, f"uci -q get wireless.{section}.key")
         if not ssid or not 8 <= len(key) <= 63:
             sys.exit(f"wireless.{section}: need an ssid and an 8-63 character passphrase")
+        ssid += args.suffix
+        if len(ssid.encode()) > 32:
+            sys.exit(f"{ssid!r} is longer than the 32 bytes an SSID allows")
         out[band] = wsc.BssConfig(ssid=ssid, passphrase=key)
     return out
 
@@ -47,6 +50,7 @@ def main() -> None:
     p.add_argument("--iface24", default="wifinet0", help="UCI wifi-iface whose SSID/key the agent's 2.4 GHz radio gets")
     p.add_argument("--iface5", default="wifinet1", help="UCI wifi-iface whose SSID/key the agent's 5 GHz radio gets")
     p.add_argument("--agent", help="only talk to this agent AL MAC")
+    p.add_argument("--suffix", default="", help='appended to the router SSIDs for the agent, e.g. " Ext"')
     p.add_argument("--respond", action="store_true")
     p.add_argument("--configure", action="store_true")
     p.add_argument("--bands", choices=["24", "5", "both"], default="24",
