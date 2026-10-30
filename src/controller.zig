@@ -588,25 +588,28 @@ pub const Controller = struct {
         return now - s.at.? < hold;
     }
 
+    /// Steering a client again means it is still where the last move left it:
+    /// it refused, so its hold doubles. Inferred rather than taken from answer
+    /// events: on the C6, hostapd's bss-transition-response never reached a
+    /// subscriber, and the satellite may not report either.
     fn noteSteer(c: *Controller, sta: Mac, now: Ms) void {
         if (c.steeredEntry(sta)) |s| {
+            const long_ago = timing.steer_hold << (timing.max_backoff + 1);
+            if (now - s.at.? > long_ago) s.refused = 0 else s.refused +|= 1;
             s.at = now;
+            if (s.refused > 0) log.info("client {x} stayed put after the last move ({d} in a row), next try in {d} min", .{ sta, s.refused, @divTrunc(timing.steer_hold << @min(s.refused, timing.max_backoff), std.time.ms_per_min) });
             return;
         }
         c.steered[c.next_steered] = .{ .mac = sta, .at = now };
         c.next_steered = (c.next_steered + 1) % @as(u8, c.steered.len);
     }
 
-    /// A client's answer to a move (802.11v BTM status, 0 = accept), reported
-    /// by the router's hostapd or by the agent. Refusals back off.
+    /// A client's answer to a move (802.11v BTM status, 0 = accept), when the
+    /// router's hostapd or the agent reports one. An accept resets the back-off;
+    /// refusals are counted by `noteSteer`, so they aren't counted twice.
     pub fn onBtmAnswer(c: *Controller, sta: Mac, status: u8) void {
         const s = c.steeredEntry(sta) orelse return;
-        if (status == 0) {
-            s.refused = 0;
-            return;
-        }
-        s.refused +|= 1;
-        log.info("client {x} refused the move ({d} in a row), next try in {d} min", .{ sta, s.refused, @divTrunc(timing.steer_hold << @min(s.refused, timing.max_backoff), std.time.ms_per_min) });
+        if (status == 0) s.refused = 0;
     }
 
     /// Asks a weak agent client, through the agent, how it hears the router
@@ -1257,11 +1260,21 @@ test "steering by beacon report; refusals back off; no suggestion without 802.11
     try testing.expectEqual(@as(?i8, -71), cl.heard.?.serving);
     try testing.expectEqual(cmdu.MsgType.client_steering_request, (try cmdu.Frame.parse((try c.tick(5 * s, &out)).frame.?)).msg_type);
 
-    // It refuses: the hold doubles to 10 minutes.
-    const refused = radio5 ++ phone ++ [_]u8{1};
-    _ = try c.onFrame(try frameFrom(&in, .client_steering_btm_report, &.{.{ .type = .steering_btm_report, .value = &refused }}), 6 * s, &out, testSecrets());
-    try testing.expect(c.recentlySteered(phone, 5 * s + 6 * std.time.ms_per_min));
-    try testing.expect(!c.recentlySteered(phone, 5 * s + 11 * std.time.ms_per_min));
+    // Held 5 minutes; steered again after that, it evidently stayed put, so
+    // the next hold is 10 minutes, then 20.
+    const m = std.time.ms_per_min;
+    try testing.expect(c.recentlySteered(phone, 5 * s + 4 * m));
+    try testing.expect(!c.recentlySteered(phone, 5 * s + 6 * m));
+    c.noteSteer(phone, 6 * m);
+    try testing.expect(c.recentlySteered(phone, 6 * m + 9 * m));
+    try testing.expect(!c.recentlySteered(phone, 6 * m + 11 * m));
+    c.noteSteer(phone, 17 * m);
+    try testing.expect(c.recentlySteered(phone, 17 * m + 19 * m));
+
+    // A reported accept resets it.
+    const accepted = radio5 ++ phone ++ [_]u8{0} ++ c6_5g;
+    _ = try c.onFrame(try frameFrom(&in, .client_steering_btm_report, &.{.{ .type = .steering_btm_report, .value = &accepted }}), 18 * m, &out, testSecrets());
+    try testing.expect(!c.recentlySteered(phone, 17 * m + 6 * m));
 
     // A router client without 802.11v is never sent a suggestion.
     const old_laptop: Mac = .{ 0x02, 0, 0, 0, 0, 0xa3 };
