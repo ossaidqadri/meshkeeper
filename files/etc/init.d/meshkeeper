@@ -22,7 +22,7 @@ start_service() {
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1
 	[ -x /sbin/ujail -a -e /etc/capabilities/meshkeeper.json ] && {
-		procd_add_jail meshkeeper ubus sysfs
+		procd_add_jail meshkeeper ubus sysfs log
 		procd_add_jail_mount /bin/ubus
 		procd_add_jail_mount_rw "$STATE_DIR"
 		procd_set_param capabilities /etc/capabilities/meshkeeper.json

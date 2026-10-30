@@ -5,6 +5,7 @@
 //! feeds the pure `Controller`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
 const Io = std.Io;
@@ -13,8 +14,41 @@ const cmdu = @import("cmdu.zig");
 const wsc = @import("wsc.zig");
 const Controller = @import("controller.zig").Controller;
 
-pub const std_options: std.Options = .{ .log_level = .info };
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .logFn = if (builtin.os.tag == .linux and !builtin.is_test) syslogLog else std.log.defaultLog,
+};
 const log = std.log.scoped(.main);
+
+/// Logs to syslog with each message's own severity. procd files everything a
+/// service writes to stderr under LOG_ERR, so stderr stays for panic traces only.
+/// Speaks the /dev/log datagram protocol directly rather than linking libc for
+/// syslog(3); a fresh socket per line keeps working across logd restarts.
+fn syslogLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    const severity: u8 = switch (level) {
+        .err => 3,
+        .warn => 4,
+        .info => 6,
+        .debug => 7,
+    };
+    const facility_daemon = 3 << 3;
+    var buf: [1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    // Overlong messages are cut at the buffer end, like syslog(3) does.
+    w.print("<{d}>meshkeeper[{d}]: {t}: ", .{ facility_daemon | severity, linux.getpid(), scope }) catch {};
+    w.print(format, args) catch {};
+    const msg = w.buffered();
+
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) == .SUCCESS) {
+        const fd: posix.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        var addr: linux.sockaddr.un = .{ .path = @splat(0) };
+        @memcpy(addr.path[0.."/dev/log".len], "/dev/log");
+        if (linux.errno(linux.sendto(fd, msg.ptr, msg.len, 0, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) == .SUCCESS) return;
+    }
+    std.log.defaultLog(level, scope, format, args);
+}
 
 const usage =
     \\usage: meshkeeper [--observe] [--config NAME]
