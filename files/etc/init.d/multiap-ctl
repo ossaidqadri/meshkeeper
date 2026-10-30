@@ -8,7 +8,11 @@ STATE_DIR=/etc/multiap-ctl
 
 start_service() {
 	# Unprivileged account; the ubus ACL in /usr/share/acl.d grants it only the calls it makes.
-	user_exists multiap || user_add multiap "" "$(group_add_next multiap)" multiap "$STATE_DIR"
+	# ubusd resolves ACL user names when it loads them, so a new user needs a reload.
+	user_exists multiap || {
+		user_add multiap "" "$(group_add_next multiap)" multiap "$STATE_DIR"
+		kill -HUP "$(pidof ubusd)"
+	}
 	mkdir -p "$STATE_DIR"
 	chown -R multiap:multiap "$STATE_DIR"
 
