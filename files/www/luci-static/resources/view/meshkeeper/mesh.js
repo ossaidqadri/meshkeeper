@@ -21,13 +21,19 @@ function satelliteName(agents, i) {
 	return agents.length > 1 ? _('Satellite %d').format(i + 1) : _('Satellite');
 }
 
-function statusText(mesh) {
+// `links`: satellite backhaul MAC to the signal the main router hears from it,
+// the number that matters when placing the satellite.
+function statusText(mesh, links) {
 	if (!mesh)
 		return _('meshkeeper is not running, devices on the satellite are not shown.');
 	if (!mesh.agents.length)
 		return _('No satellite has joined yet.');
-	return mesh.agents.map((a, i) => '%s: %s'.format(satelliteName(mesh.agents, i),
-		a.online ? _('online') : _('offline'))).join(', ');
+	return mesh.agents.map((a, i) => {
+		const link = a.ifaces.map(m => links.get(m)).find(s => s != null);
+		const state = !a.online ? _('offline')
+			: link == null ? _('online') : _('online, link to main router %s').format(signalText(link));
+		return '%s: %s'.format(satelliteName(mesh.agents, i), state);
+	}).join('. ');
 }
 
 return view.extend({
@@ -45,10 +51,13 @@ return view.extend({
 		// A satellite's own backhaul link shows up as a main router client; skip it.
 		const backhaul = new Set(agents.flatMap(a => a.ifaces));
 		const name = mac => hints.getHostnameByMACAddr(mac) || mac;
+		const links = new Map();
 		const rows = [];
 
 		for (const sta of local.flat())
-			if (!backhaul.has(sta.mac.toLowerCase()))
+			if (backhaul.has(sta.mac.toLowerCase()))
+				links.set(sta.mac.toLowerCase(), sta.signal);
+			else
 				rows.push([ name(sta.mac), _('Main router'), signalText(sta.signal),
 					'%d / %d Mbit/s'.format(sta.tx.rate / 1000, sta.rx.rate / 1000) ]);
 
@@ -60,7 +69,7 @@ return view.extend({
 					c.rssi == null ? '-' : '%d / %d Mbit/s'.format(c.down_mbps, c.up_mbps) ]);
 		});
 
-		status.textContent = statusText(mesh);
+		status.textContent = statusText(mesh, links);
 		cbi_update_table(table, rows, E('em', _('No wireless devices connected')));
 	},
 
@@ -81,7 +90,7 @@ return view.extend({
 		return E([], [
 			E('h2', _('Mesh')),
 			E('div', { 'class': 'cbi-map-descr' },
-				_('Every wireless device and the router it is on. Updates every 5 seconds, so you can watch the signal while moving the satellite.')),
+				_('Every wireless device and the router it is on. The satellite link and main router devices update every 5 seconds, so you can watch the link while moving the satellite. Each satellite device is measured in turn, every 10 seconds per device.')),
 			status,
 			table
 		]);

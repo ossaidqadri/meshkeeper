@@ -126,6 +126,7 @@ pub fn main(init: std.process.Init) !void {
     defer probes.stop(io);
     var resubscribe_at: i64 = 0;
     var mesh_at: i64 = 0;
+    var mesh_failing = false; // log a failing write once, not every 5 s into logd's small ring
 
     var rx: [cmdu.max_frame]u8 = undefined;
     var tx: [cmdu.max_frame]u8 = undefined;
@@ -190,7 +191,13 @@ pub fn main(init: std.process.Init) !void {
 
         if (now >= mesh_at) {
             mesh_at = now + mesh_every_ms;
-            writeMesh(io, &ctl, now) catch |err| log.warn("writing {s} failed: {t}", .{ mesh_path, err });
+            if (writeMesh(io, &ctl, now)) |_| {
+                if (mesh_failing) log.info("writing {s} works again", .{mesh_path});
+                mesh_failing = false;
+            } else |err| {
+                if (!mesh_failing) log.warn("writing {s} failed: {t}", .{ mesh_path, err });
+                mesh_failing = true;
+            }
         }
     }
 }
