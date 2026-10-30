@@ -59,6 +59,11 @@ pub const timing = struct {
 
 pub const steer_margin: i8 = 10;
 pub const steer_weak: i8 = -75;
+/// An agent client is only moved when the agent hears it worse than this.
+pub const agent_weak: i8 = -65;
+
+/// `log` makes every decision and logs it, but sends nothing: the trial mode.
+pub const Steering = enum { off, log, on };
 
 /// A fronthaul BSS of the router itself (from hostapd).
 pub const LocalBss = struct {
@@ -118,7 +123,7 @@ pub const Config = struct {
     /// Fronthaul credentials per agent radio band: [0] 2.4 GHz, [1] 5 GHz.
     fronthaul: [2]?wsc.Bss,
     auto_wps: bool,
-    steering: bool = false,
+    steering: Steering = .off,
     local: []const LocalBss = &.{},
 };
 
@@ -539,6 +544,10 @@ pub const Controller = struct {
         c.n_local = n;
     }
 
+    fn wouldPrefix(c: *const Controller) []const u8 {
+        return if (c.cfg.steering == .log) "would be " else "";
+    }
+
     fn recentlySteered(c: *const Controller, sta: Mac, now: Ms) bool {
         for (c.steered) |s| {
             const at = s.at orelse continue;
@@ -553,17 +562,21 @@ pub const Controller = struct {
     }
 
     /// An agent client the router hears clearly better: steering request frame.
+    // ponytail: link metrics go round robin, one client per 10 s, so with more
+    // than 3 agent clients a reading is older than `reading_fresh` and this never
+    // fires; query the client the router just heard instead if that matters.
     fn steerFromAgent(c: *Controller, a: *Agent, now: Ms, out: []u8) !?[]const u8 {
         for (a.clients[0..a.n_clients]) |*cl| {
             const rssi = cl.rssi orelse continue;
             const h = cl.heard orelse continue;
             const measured = cl.metrics_at orelse continue;
             if (now - measured > timing.reading_fresh or now - h.at > timing.reading_fresh) continue;
-            if (@as(i16, h.rssi) - rssi < steer_margin or c.recentlySteered(cl.mac, now)) continue;
+            if (rssi >= agent_weak or @as(i16, h.rssi) - rssi < steer_margin or c.recentlySteered(cl.mac, now)) continue;
             c.noteSteer(cl.mac, now);
             cl.heard = null;
             const target = c.cfg.local[h.bss].target();
-            log.info("steering {x} from agent {x} ({d} dBm) to router {x} ({d} dBm)", .{ cl.mac, a.al_mac, rssi, target.bssid, h.rssi });
+            log.info("{s}steering {x} from agent {x} ({d} dBm) to router {x} ({d} dBm)", .{ c.wouldPrefix(), cl.mac, a.al_mac, rssi, target.bssid, h.rssi });
+            if (c.cfg.steering == .log) return null;
             const req = cmdu.steeringRequest(cl.bssid, cl.mac, target);
             return try cmdu.build(out, a.al_mac, c.cfg.al_mac, .client_steering_request, c.mid(), &.{
                 .{ .type = .steering_request, .value = &req },
@@ -582,7 +595,8 @@ pub const Controller = struct {
             const since = lc.weak_since orelse continue;
             if (now - since < timing.weak_for or c.recentlySteered(lc.mac, now)) continue;
             c.noteSteer(lc.mac, now);
-            log.info("suggesting agent {x} BSS {x} to {x} ({d} dBm on the router)", .{ a.al_mac, agent_bss, lc.mac, lc.rssi });
+            log.info("{s}suggesting agent {x} BSS {x} to {x} ({d} dBm on the router)", .{ c.wouldPrefix(), a.al_mac, agent_bss, lc.mac, lc.rssi });
+            if (c.cfg.steering == .log) return null;
             // The agent's 5 GHz fronthaul shares the radio, and so the channel,
             // with its backhaul link to this router's 5 GHz BSS.
             return .{ .sta = lc.mac, .bss = lc.bss, .target = .{ .bssid = agent_bss, .op_class = local.op_class, .channel = local.channel } };
@@ -622,7 +636,7 @@ pub const Controller = struct {
                 a.last_caps_query = now;
                 return .{ .frame = try cmdu.build(out, a.al_mac, c.cfg.al_mac, .ap_capability_query, c.mid(), &.{}) };
             }
-            if (c.cfg.steering) {
+            if (c.cfg.steering != .off) {
                 if (try c.steerFromAgent(a, now, out)) |frame| return .{ .frame = frame };
                 if (c.steerToAgent(a, now)) |btm| return .{ .btm = btm };
             }
@@ -1030,7 +1044,7 @@ test "steering: both directions, same band only, held against ping-pong, reports
         .{ .bssid = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x41 }, .band = .@"2.4", .op_class = 81, .channel = 1 },
     };
     var c = testController(false);
-    c.cfg.steering = true;
+    c.cfg.steering = .on;
     c.cfg.local = &local;
     var in: [cmdu.max_frame]u8 = undefined;
     var out: [cmdu.max_frame]u8 = undefined;
@@ -1049,6 +1063,18 @@ test "steering: both directions, same band only, held against ping-pong, reports
     c.onProbe(phone, s, .{ .bss = 1, .rssi = -50, .at = s }); // 2.4 GHz: can't move there
     try testing.expectEqual(null, a.client(phone).?.heard);
     c.onProbe(phone, 2 * s, .{ .bss = 0, .rssi = -62, .at = 2 * s });
+
+    // Log mode decides the same but sends nothing.
+    c.cfg.steering = .log;
+    const logged = try c.tick(3 * s, &out);
+    try testing.expect(logged.btm == null);
+    try testing.expect((try cmdu.Frame.parse(logged.frame.?)).msg_type != .client_steering_request);
+    try testing.expect(c.recentlySteered(phone, 3 * s));
+    c.cfg.steering = .on;
+    c.steered = @splat(.{ .mac = @splat(0), .at = null });
+    c.onProbe(phone, 3 * s, .{ .bss = 0, .rssi = -62, .at = 3 * s });
+    a.last_metrics_query = 3 * s;
+
     const t = try c.tick(3 * s, &out);
     const req: cmdu.Frame = try .parse(t.frame.?);
     try testing.expectEqual(cmdu.MsgType.client_steering_request, req.msg_type);

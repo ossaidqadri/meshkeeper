@@ -10,6 +10,7 @@ config controller 'main'
 	# Open the router's WPS window when a known satellite lost power and is
 	# searching (see README for the security trade-off).
 	option auto_wps '1'
-	# Suggest a better router to clients (802.11v). Needs one shared name
+	# Suggest a better router to clients (802.11v): '1' on, 'log' only logs
+	# what it would do. Needs one shared name
 	# (ssid_suffix ''), since clients only move between BSSes of one network.
 	option steering '0'

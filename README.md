@@ -128,12 +128,13 @@ config controller 'main'
 	# Open the router's WPS window when a known satellite lost power and is
 	# searching (see README for the security trade-off).
 	option auto_wps '1'
-	# Suggest a better router to clients (802.11v). Needs one shared name
+	# Suggest a better router to clients (802.11v): '1' on, 'log' only logs
+	# what it would do. Needs one shared name
 	# (ssid_suffix ''), since clients only move between BSSes of one network.
 	option steering '0'
 ```
 
-With `steering '1'`, a device on the satellite that the router hears at least 10 dB better gets asked (through the satellite) to move to the router, and a device on the router's 5 GHz that stays below -75 dBm for 20 seconds gets the satellite suggested. It's a suggestion, never a kick: the device can say no. Each device is moved at most once every 5 minutes so it can't bounce. The satellite can't measure devices it isn't serving, so the second direction relies on the device's own scan. While steering is on, the router's 5 GHz and 2.4 GHz networks announce 802.11v support until the next Wi-Fi reload, when meshkeeper turns it back on.
+With `steering '1'`, a device on the satellite that the satellite hears below -65 dBm and the router hears at least 10 dB better gets asked (through the satellite) to move to the router, and a device on the router's 5 GHz that stays below -75 dBm for 20 seconds gets the satellite suggested. `steering 'log'` makes the same decisions and only logs them, a safe way to see what it would do first. It's a suggestion, never a kick: the device can say no. Each device is moved at most once every 5 minutes so it can't bounce. The satellite can't measure devices it isn't serving, so the second direction relies on the device's own scan. While steering is on, the router's 5 GHz and 2.4 GHz networks announce 802.11v support until the next Wi-Fi reload, when meshkeeper turns it back on.
 
 Set `fronthaul_2g` and `fronthaul_5g` to your own wireless section names. A fresh OpenWrt usually has `default_radio0` and `default_radio1`, and `uci show wireless | grep =wifi-iface` lists yours. With a wrong name it logs "wireless section not found" and pushes nothing. The sections need a name; an anonymous `config wifi-iface` can't be picked.
 

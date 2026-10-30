@@ -79,7 +79,7 @@ const Settings = struct {
     wps_object: ?[]const u8,
     /// Every hostapd object, for probe events and dropping stale stations.
     hostapd_objects: []const []const u8,
-    steering: bool,
+    steering: controller.Steering,
     /// The router's fronthaul BSSes and their hostapd objects, same order.
     local: []const controller.LocalBss,
     local_objects: []const []const u8,
@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     }, first_mid);
     loadState(init.gpa, io, &ctl);
 
-    log.info("controller {x} on {s}{s}, auto-WPS {s}, steering {s}", .{ sock.mac, settings.interface, if (observe) " (observe only)" else "", if (ctl.cfg.auto_wps) "on" else "off", if (ctl.cfg.steering) "on" else "off" });
+    log.info("controller {x} on {s}{s}, auto-WPS {s}, steering {s}", .{ sock.mac, settings.interface, if (observe) " (observe only)" else "", if (ctl.cfg.auto_wps) "on" else "off", @tagName(ctl.cfg.steering) });
     for (settings.fronthaul, [_][]const u8{ "2.4", "5" }) |bss, band| {
         if (bss) |b| log.info("  {s} GHz agent radios get \"{s}\"", .{ band, b.ssid });
     }
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
                 ctl.cfg.fronthaul = settings.fronthaul;
                 ctl.cfg.steering = settings.steering;
                 ctl.setLocal(settings.local);
-                if (settings.steering and !observe) enableBtm(init.gpa, io, settings);
+                if (settings.steering == .on and !observe) enableBtm(init.gpa, io, settings);
             } else |err| {
                 fresh.deinit();
                 log.warn("reloading settings failed ({t}), keeping the old ones", .{err});
@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
         if (t.wps) |w| openWps(init.gpa, io, settings, w);
         if (t.btm) |b| suggestMove(init.gpa, io, settings, observe, b);
 
-        if (settings.steering and now >= local_at) {
+        if (settings.steering != .off and now >= local_at) {
             local_at = now + local_every_ms;
             pollLocalClients(init.gpa, io, settings, &ctl, now);
         }
@@ -519,7 +519,12 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
         .auto_wps = std.mem.eql(u8, main_section.get("auto_wps") orelse "0", "1"),
         .wps_object = wps_object,
         .hostapd_objects = objects.items,
-        .steering = std.mem.eql(u8, main_section.get("steering") orelse "0", "1"),
+        .steering = steering: {
+            const v = main_section.get("steering") orelse "0";
+            if (std.mem.eql(u8, v, "1")) break :steering .on;
+            if (std.mem.eql(u8, v, "log")) break :steering .log;
+            break :steering .off;
+        },
         .local = local.items,
         .local_objects = local_objects.items,
     };
