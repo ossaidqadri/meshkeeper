@@ -30,6 +30,9 @@ pub const MsgType = enum(u16) {
     ap_capability_report = 0x8002,
     assoc_sta_link_metrics_query = 0x800D,
     assoc_sta_link_metrics_response = 0x800E,
+    client_steering_request = 0x8014,
+    client_steering_btm_report = 0x8015,
+    steering_completed = 0x8017,
     _,
 };
 
@@ -51,6 +54,8 @@ pub const Tlv = enum(u8) {
     client_association_event = 0x92,
     sta_mac_address = 0x95,
     associated_sta_link_metrics = 0x96,
+    steering_request = 0x9B,
+    steering_btm_report = 0x9C,
     ap_capability = 0xA1,
     error_code = 0xA3,
     multi_ap_profile = 0xB3,
@@ -291,7 +296,46 @@ pub const AssociationEvent = struct {
     }
 };
 
+pub const SteerTarget = struct { bssid: Mac, op_class: u8, channel: u8 };
+
+/// Steering Request TLV value (EasyMesh 17.2.29, layout as in prplMesh tlvf):
+/// a steering mandate for one client of `serving`, towards one target BSS.
+/// The agent sends the client an 802.11v BTM request; abridged, so the client
+/// prefers the listed BSS, and no disassociation threat: the client may refuse.
+pub fn steeringRequest(serving: Mac, sta: Mac, target: SteerTarget) [27]u8 {
+    const mode_mandate = 0x80;
+    const btm_abridged = 0x20;
+    var v: [27]u8 = undefined;
+    v[0..6].* = serving;
+    v[6] = mode_mandate | btm_abridged;
+    v[7..11].* = .{ 0, 0, 0, 0 }; // opportunity window, BTM disassociation timer
+    v[11] = 1;
+    v[12..18].* = sta;
+    v[18] = 1;
+    v[19..25].* = target.bssid;
+    v[25] = target.op_class;
+    v[26] = target.channel;
+    return v;
+}
+
+/// Steering BTM Report TLV: the client's answer to a BTM request (0 = accept).
+pub const BtmReport = struct {
+    bssid: Mac,
+    sta: Mac,
+    status: u8,
+
+    pub fn parse(value: []const u8) ParseError!BtmReport {
+        if (value.len < 13) return error.Truncated;
+        return .{ .bssid = value[0..6].*, .sta = value[6..12].*, .status = value[12] };
+    }
+};
+
 const testing = std.testing;
+
+test "steering request layout" {
+    const v = steeringRequest(.{ 1, 1, 1, 1, 1, 1 }, .{ 2, 2, 2, 2, 2, 2 }, .{ .bssid = .{ 3, 3, 3, 3, 3, 3 }, .op_class = 128, .channel = 149 });
+    try testing.expectEqualSlices(u8, &([_]u8{ 1, 1, 1, 1, 1, 1, 0xa0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 1, 3, 3, 3, 3, 3, 3, 128, 149 }), &v);
+}
 
 test "associated clients and link metrics walks" {
     const ac = [_]u8{2} ++ [_]u8{ 1, 1, 1, 1, 1, 1, 0, 2 } ++ [_]u8{ 0xa, 0, 0, 0, 0, 1, 0, 5 } ++ [_]u8{ 0xa, 0, 0, 0, 0, 2, 0, 6 } ++
@@ -386,6 +430,7 @@ test "fuzz: random and truncated frames never crash the parsers" {
                     while (m.next() catch null) |_| {}
                 },
                 .client_association_event => _ = AssociationEvent.parse(e.value) catch {},
+                .steering_btm_report => _ = BtmReport.parse(e.value) catch {},
                 else => {},
             }
         }

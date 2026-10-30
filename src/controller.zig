@@ -10,6 +10,16 @@
 //!   With `auto_wps`, the controller opens the router's WPS window, behind a
 //!   gate: the agent's 1905 traffic stopped, its own radio has been probing for
 //!   a minute, and windows are rate limited per outage.
+//!
+//! Steering (with `steering`), usteer-style, never forcing a client off:
+//! - Agent client: steered to a router BSS on the same band when the router
+//!   hears its probes `steer_margin` dB better than the agent hears it.
+//!   EasyMesh Client Steering Request; the agent sends the 802.11v request.
+//! - Router client: the agent can't measure clients it doesn't serve (AX12),
+//!   so a router client that stays weak on 5 GHz gets an 802.11v suggestion
+//!   for the agent's 5 GHz BSS and decides from its own scan.
+//! - One steer per client per `steer_hold`, in either direction, so a client
+//!   can't ping-pong.
 
 const std = @import("std");
 const cmdu = @import("cmdu.zig");
@@ -40,7 +50,41 @@ pub const timing = struct {
     pub const caps_retry: Ms = 60 * std.time.ms_per_s;
     /// One associated-client metrics query per agent this often, round robin.
     pub const metrics_interval: Ms = 10 * std.time.ms_per_s;
+    /// Readings older than this don't count for steering.
+    pub const reading_fresh: Ms = 30 * std.time.ms_per_s;
+    /// A router client must stay below `steer_weak` this long before a suggestion.
+    pub const weak_for: Ms = 20 * std.time.ms_per_s;
+    pub const steer_hold: Ms = 5 * std.time.ms_per_min;
 };
+
+pub const steer_margin: i8 = 10;
+pub const steer_weak: i8 = -75;
+
+/// A fronthaul BSS of the router itself (from hostapd).
+pub const LocalBss = struct {
+    bssid: Mac,
+    band: Band,
+    op_class: u8,
+    channel: u8,
+
+    fn target(l: LocalBss) cmdu.SteerTarget {
+        return .{ .bssid = l.bssid, .op_class = l.op_class, .channel = l.channel };
+    }
+};
+
+/// How a router BSS hears a station: index into `Config.local`, signal in dBm.
+pub const Heard = struct { bss: u8, rssi: i8, at: Ms };
+
+/// A client of the router itself, from hostapd's client list.
+pub const LocalClient = struct {
+    mac: Mac,
+    bss: u8,
+    rssi: i8,
+    weak_since: ?Ms = null,
+};
+
+/// 802.11v suggestion the caller sends through the router's own hostapd.
+pub const Btm = struct { sta: Mac, bss: u8, target: cmdu.SteerTarget };
 
 /// A Wi-Fi client of an agent, as the agent reports it.
 pub const Client = struct {
@@ -51,6 +95,8 @@ pub const Client = struct {
     downlink_mbps: u32 = 0,
     uplink_mbps: u32 = 0,
     metrics_at: ?Ms = null,
+    /// Best recent probe a router BSS on the same band heard from it.
+    heard: ?Heard = null,
 };
 
 /// Credentials digest, so a password change is detected without storing it.
@@ -72,9 +118,11 @@ pub const Config = struct {
     /// Fronthaul credentials per agent radio band: [0] 2.4 GHz, [1] 5 GHz.
     fronthaul: [2]?wsc.Bss,
     auto_wps: bool,
+    steering: bool = false,
+    local: []const LocalBss = &.{},
 };
 
-const Band = enum(u1) {
+pub const Band = enum(u1) {
     @"2.4" = 0,
     @"5" = 1,
 
@@ -85,21 +133,36 @@ const Band = enum(u1) {
             else => null,
         };
     }
+
+    pub fn fromMhz(freq: u32) Band {
+        return if (freq >= 4900) .@"5" else .@"2.4";
+    }
 };
 
 pub const Radio = struct {
     ruid: Mac,
     band: ?Band = null,
-    /// Wyhash of each SSID the agent last reported on this radio.
+    /// Wyhash of each SSID the agent last reported on this radio, and its BSSID.
     ssids: [max_ssids]u64 = undefined,
+    bssids: [max_ssids]Mac = undefined,
     n_ssids: u8 = 0,
     /// Credentials this controller pushed to (or adopted from) the radio.
     applied: ?Digest = null,
     last_push: ?Ms = null,
 
     fn broadcasts(r: Radio, ssid: []const u8) bool {
+        return r.bssOf(ssid) != null;
+    }
+
+    fn bssOf(r: Radio, ssid: []const u8) ?Mac {
         const h = std.hash.Wyhash.hash(0, ssid);
-        return std.mem.indexOfScalar(u64, r.ssids[0..r.n_ssids], h) != null;
+        const i = std.mem.indexOfScalar(u64, r.ssids[0..r.n_ssids], h) orelse return null;
+        return r.bssids[i];
+    }
+
+    fn hasBss(r: Radio, bssid: Mac) bool {
+        for (r.bssids[0..r.n_ssids]) |b| if (std.mem.eql(u8, &b, &bssid)) return true;
+        return false;
     }
 };
 
@@ -169,6 +232,19 @@ pub const Agent = struct {
         };
     }
 
+    fn bandOf(a: Agent, bssid: Mac) ?Band {
+        for (a.radios[0..a.n_radios]) |r| {
+            if (std.mem.eql(u8, &r.ruid, &bssid) or r.hasBss(bssid)) return r.band;
+        }
+        return null;
+    }
+
+    /// The agent's BSS broadcasting `ssid` on `band`.
+    fn fronthaulBss(a: Agent, band: Band, ssid: []const u8) ?Mac {
+        for (a.radios[0..a.n_radios]) |r| if (r.band == band) return r.bssOf(ssid);
+        return null;
+    }
+
     fn silent(a: Agent, now: Ms) bool {
         const heard = a.last_heard orelse return true;
         return now - heard > timing.agent_silent_after;
@@ -190,6 +266,11 @@ pub const Controller = struct {
     next_mid: u16,
     /// Learned state changed; the caller should persist it.
     dirty: bool = false,
+    local_clients: [max_clients]LocalClient = undefined,
+    n_local: u8 = 0,
+    /// Recently steered clients, oldest overwritten first.
+    steered: [16]struct { mac: Mac, at: ?Ms } = @splat(.{ .mac = @splat(0), .at = null }),
+    next_steered: u8 = 0,
 
     pub fn init(cfg: Config, first_mid: u16) Controller {
         return .{ .cfg = cfg, .next_mid = first_mid };
@@ -279,6 +360,13 @@ pub const Controller = struct {
                 learnLinkMetrics(a, f, now);
                 return null;
             },
+            // The agent waits for a 1905 ACK on both, and retries without one.
+            .client_steering_btm_report, .steering_completed => {
+                if (f.find(.steering_btm_report)) |v| if (cmdu.BtmReport.parse(v)) |r| {
+                    log.info("agent {x}: client {x} {s} the move (BTM status {d})", .{ a.al_mac, r.sta, if (r.status == 0) "accepted" else "declined", r.status });
+                } else |_| {};
+                return try cmdu.build(out, f.src, c.cfg.al_mac, .ack, f.mid, &.{});
+            },
             .ap_autoconfig_wsc => return c.answerM1(a, f, now, out, secrets),
             else => return null,
         }
@@ -297,6 +385,7 @@ pub const Controller = struct {
                 const rad = r orelse continue;
                 if (rad.n_ssids == max_ssids) continue;
                 rad.ssids[rad.n_ssids] = std.hash.Wyhash.hash(0, bss.ssid);
+                rad.bssids[rad.n_ssids] = bss.bssid;
                 rad.n_ssids += 1;
             }
         }
@@ -403,17 +492,107 @@ pub const Controller = struct {
         return false;
     }
 
-    /// A probe request reached a router AP; `sta` is the sender.
-    pub fn onProbe(c: *Controller, sta: Mac, now: Ms) void {
-        for (c.agents[0..c.n_agents]) |*a| if (a.ownsIface(sta)) {
-            a.last_probe = now;
-            a.probing_iface = sta;
+    /// A probe request reached a router AP; `sta` is the sender. `heard` is
+    /// set when it reached one of the router's fronthaul BSSes.
+    pub fn onProbe(c: *Controller, sta: Mac, now: Ms, heard: ?Heard) void {
+        for (c.agents[0..c.n_agents]) |*a| {
+            if (a.ownsIface(sta)) {
+                a.last_probe = now;
+                a.probing_iface = sta;
+            }
+            const h = heard orelse continue;
+            const cl = a.client(sta) orelse continue;
+            // Only a BSS the client could move to: same band, same network.
+            if (a.bandOf(cl.bssid) != c.cfg.local[h.bss].band) continue;
+            const old = cl.heard;
+            if (old == null or now - old.?.at > timing.reading_fresh or h.rssi >= old.?.rssi) cl.heard = h;
+        }
+    }
+
+    /// New router BSS list (after a Wi-Fi reload): readings that index the old one go.
+    pub fn setLocal(c: *Controller, local: []const LocalBss) void {
+        c.cfg.local = local;
+        c.n_local = 0;
+        for (c.agents[0..c.n_agents]) |*a| for (a.clients[0..a.n_clients]) |*cl| {
+            cl.heard = null;
         };
     }
 
-    pub const Tick = struct { frame: ?[]const u8 = null, wps: ?WpsAction = null };
+    /// The router's own clients on its fronthaul BSSes, polled from hostapd.
+    pub fn setLocalClients(c: *Controller, list: []const LocalClient, now: Ms) void {
+        var fresh: [max_clients]LocalClient = undefined;
+        var n: u8 = 0;
+        for (list) |in| {
+            if (n == max_clients) break;
+            var lc = in;
+            lc.weak_since = null;
+            if (lc.rssi < steer_weak) {
+                lc.weak_since = now;
+                for (c.local_clients[0..c.n_local]) |old| if (std.mem.eql(u8, &old.mac, &lc.mac) and old.bss == lc.bss) {
+                    lc.weak_since = old.weak_since orelse now;
+                };
+            }
+            fresh[n] = lc;
+            n += 1;
+        }
+        c.local_clients = fresh;
+        c.n_local = n;
+    }
 
-    /// Periodic work: topology queries, renew requests and the auto-WPS gate.
+    fn recentlySteered(c: *const Controller, sta: Mac, now: Ms) bool {
+        for (c.steered) |s| {
+            const at = s.at orelse continue;
+            if (std.mem.eql(u8, &s.mac, &sta) and now - at < timing.steer_hold) return true;
+        }
+        return false;
+    }
+
+    fn noteSteer(c: *Controller, sta: Mac, now: Ms) void {
+        c.steered[c.next_steered] = .{ .mac = sta, .at = now };
+        c.next_steered = (c.next_steered + 1) % @as(u8, c.steered.len);
+    }
+
+    /// An agent client the router hears clearly better: steering request frame.
+    fn steerFromAgent(c: *Controller, a: *Agent, now: Ms, out: []u8) !?[]const u8 {
+        for (a.clients[0..a.n_clients]) |*cl| {
+            const rssi = cl.rssi orelse continue;
+            const h = cl.heard orelse continue;
+            const measured = cl.metrics_at orelse continue;
+            if (now - measured > timing.reading_fresh or now - h.at > timing.reading_fresh) continue;
+            if (@as(i16, h.rssi) - rssi < steer_margin or c.recentlySteered(cl.mac, now)) continue;
+            c.noteSteer(cl.mac, now);
+            cl.heard = null;
+            const target = c.cfg.local[h.bss].target();
+            log.info("steering {x} from agent {x} ({d} dBm) to router {x} ({d} dBm)", .{ cl.mac, a.al_mac, rssi, target.bssid, h.rssi });
+            const req = cmdu.steeringRequest(cl.bssid, cl.mac, target);
+            return try cmdu.build(out, a.al_mac, c.cfg.al_mac, .client_steering_request, c.mid(), &.{
+                .{ .type = .steering_request, .value = &req },
+            });
+        }
+        return null;
+    }
+
+    /// A router client weak for a while on 5 GHz: suggest the agent's 5 GHz BSS.
+    fn steerToAgent(c: *Controller, a: *const Agent, now: Ms) ?Btm {
+        const want = c.cfg.fronthaul[@intFromEnum(Band.@"5")] orelse return null;
+        const agent_bss = a.fronthaulBss(.@"5", want.ssid) orelse return null;
+        for (c.local_clients[0..c.n_local]) |lc| {
+            const local = c.cfg.local[lc.bss];
+            if (local.band != .@"5" or a.ownsIface(lc.mac)) continue;
+            const since = lc.weak_since orelse continue;
+            if (now - since < timing.weak_for or c.recentlySteered(lc.mac, now)) continue;
+            c.noteSteer(lc.mac, now);
+            log.info("suggesting agent {x} BSS {x} to {x} ({d} dBm on the router)", .{ a.al_mac, agent_bss, lc.mac, lc.rssi });
+            // The agent's 5 GHz fronthaul shares the radio, and so the channel,
+            // with its backhaul link to this router's 5 GHz BSS.
+            return .{ .sta = lc.mac, .bss = lc.bss, .target = .{ .bssid = agent_bss, .op_class = local.op_class, .channel = local.channel } };
+        }
+        return null;
+    }
+
+    pub const Tick = struct { frame: ?[]const u8 = null, wps: ?WpsAction = null, btm: ?Btm = null };
+
+    /// Periodic work: topology queries, renew requests, the auto-WPS gate and steering.
     pub fn tick(c: *Controller, now: Ms, out: []u8) !Tick {
         for (c.agents[0..c.n_agents]) |*a| {
             if (c.wpsGate(a, now)) |action| return .{ .wps = action };
@@ -442,6 +621,10 @@ pub const Controller = struct {
             if (a.caps == null and (if (a.last_caps_query) |t| now - t > timing.caps_retry else true)) {
                 a.last_caps_query = now;
                 return .{ .frame = try cmdu.build(out, a.al_mac, c.cfg.al_mac, .ap_capability_query, c.mid(), &.{}) };
+            }
+            if (c.cfg.steering) {
+                if (try c.steerFromAgent(a, now, out)) |frame| return .{ .frame = frame };
+                if (c.steerToAgent(a, now)) |btm| return .{ .btm = btm };
             }
             if (a.n_clients > 0 and (if (a.last_metrics_query) |t| now - t > timing.metrics_interval else true)) {
                 a.last_metrics_query = now;
@@ -713,7 +896,7 @@ test "auto-WPS opens only after a minute of probing while silent, rate limited" 
     var opened: u8 = 0;
     var first_open: ?Ms = null;
     while (now < 20 * std.time.ms_per_min) : (now += 5 * s) {
-        c.onProbe(ax12_bsta, now);
+        c.onProbe(ax12_bsta, now, null);
         const t = try c.tick(now, &out);
         if (t.wps) |w| {
             try testing.expectEqualSlices(u8, &ax12_bsta, &w.stale_station);
@@ -736,7 +919,7 @@ test "auto-WPS stays shut when disabled, for unknown stations, and while the age
     _ = try c.onFrame(try topologyWithSsid(&in, "MK 5GHz Ext"), 0, &out, testSecrets());
     var now: Ms = 0;
     while (now < 10 * std.time.ms_per_min) : (now += 5000) {
-        c.onProbe(ax12_bsta, now);
+        c.onProbe(ax12_bsta, now, null);
         try testing.expectEqual(null, (try c.tick(now, &out)).wps);
     }
 
@@ -745,7 +928,7 @@ test "auto-WPS stays shut when disabled, for unknown stations, and while the age
     now = 0;
     c.agent(ax12).?.last_heard = 0;
     while (now < 10 * std.time.ms_per_min) : (now += 5000) {
-        c.onProbe(stranger, now);
+        c.onProbe(stranger, now, null);
         try testing.expectEqual(null, (try c.tick(now, &out)).wps);
     }
 }
@@ -840,6 +1023,70 @@ test "mesh view: clients from topology and events, capabilities, rotating link m
     try testing.expectEqual(@as(?i64, 6), ag.clients[0].metrics_s_ago);
 }
 
+test "steering: both directions, same band only, held against ping-pong, reports ACKed" {
+    const c6_5g: Mac = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x40 };
+    const local = [_]LocalBss{
+        .{ .bssid = c6_5g, .band = .@"5", .op_class = 128, .channel = 149 },
+        .{ .bssid = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x41 }, .band = .@"2.4", .op_class = 81, .channel = 1 },
+    };
+    var c = testController(false);
+    c.cfg.steering = true;
+    c.cfg.local = &local;
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    const s = std.time.ms_per_s;
+    _ = try c.onFrame(try topologyWithSsid(&in, "MK 5GHz Ext"), 0, &out, testSecrets());
+    _ = try c.onFrame(try m1Frame(&in), 0, &out, testSecrets()); // radio5 is 5 GHz
+    const a = c.agent(ax12).?;
+    a.caps = @bitCast(@as(u8, 0x20));
+
+    // Agent to router: the phone sits on the agent at -80, the router hears it at -62.
+    const phone: Mac = .{ 0x02, 0, 0, 0, 0, 0xa1 };
+    const joined = phone ++ radio5 ++ [_]u8{0x80};
+    _ = try c.onFrame(try frameFrom(&in, .topology_notification, &.{.{ .type = .client_association_event, .value = &joined }}), s, &out, testSecrets());
+    a.client(phone).?.rssi = -80;
+    a.client(phone).?.metrics_at = s;
+    c.onProbe(phone, s, .{ .bss = 1, .rssi = -50, .at = s }); // 2.4 GHz: can't move there
+    try testing.expectEqual(null, a.client(phone).?.heard);
+    c.onProbe(phone, 2 * s, .{ .bss = 0, .rssi = -62, .at = 2 * s });
+    const t = try c.tick(3 * s, &out);
+    const req: cmdu.Frame = try .parse(t.frame.?);
+    try testing.expectEqual(cmdu.MsgType.client_steering_request, req.msg_type);
+    const v = req.find(.steering_request).?;
+    try testing.expectEqualSlices(u8, &radio5, v[0..6]);
+    try testing.expectEqualSlices(u8, &c6_5g, v[19..25]);
+
+    // The agent reports the client's answer; we ACK with its MID.
+    const report = radio5 ++ phone ++ [_]u8{0} ++ c6_5g;
+    const ack: cmdu.Frame = try .parse((try c.onFrame(try frameFrom(&in, .client_steering_btm_report, &.{.{ .type = .steering_btm_report, .value = &report }}), 4 * s, &out, testSecrets())).?);
+    try testing.expectEqual(cmdu.MsgType.ack, ack.msg_type);
+    try testing.expectEqual(7, ack.mid);
+
+    // It moved to the router and is weak there: held, no suggestion back yet.
+    c.setLocalClients(&.{.{ .mac = phone, .bss = 0, .rssi = -80 }}, 10 * s);
+    c.setLocalClients(&.{.{ .mac = phone, .bss = 0, .rssi = -80 }}, 40 * s);
+    a.metrics_seen = true;
+    a.last_metrics_query = 40 * s;
+    try testing.expectEqual(null, (try c.tick(40 * s, &out)).btm);
+
+    // Router to agent: a laptop weak on the router's 5 GHz for 20 s gets a suggestion.
+    const laptop: Mac = .{ 0x02, 0, 0, 0, 0, 0xa2 };
+    c.setLocalClients(&.{.{ .mac = laptop, .bss = 0, .rssi = -79 }}, 50 * s);
+    a.last_metrics_query = 60 * s;
+    try testing.expectEqual(null, (try c.tick(60 * s, &out)).btm); // weak only 10 s
+    c.setLocalClients(&.{.{ .mac = laptop, .bss = 0, .rssi = -78 }}, 71 * s);
+    a.last_metrics_query = 71 * s;
+    a.last_heard = 70 * s; // the agent keeps talking
+    const btm = (try c.tick(71 * s, &out)).btm.?;
+    try testing.expectEqualSlices(u8, &laptop, &btm.sta);
+    try testing.expectEqualSlices(u8, &radio5, &btm.target.bssid);
+    try testing.expectEqual(149, btm.target.channel);
+
+    // A good reading resets the weak timer.
+    c.setLocalClients(&.{.{ .mac = laptop, .bss = 0, .rssi = -60 }}, 72 * s);
+    try testing.expectEqual(null, c.local_clients[0].weak_since);
+}
+
 test "state survives a save/load round trip" {
     var c = testController(false);
     var in: [cmdu.max_frame]u8 = undefined;
@@ -867,7 +1114,7 @@ test "fuzz: random frames from a known agent never crash the controller" {
     var in: [cmdu.max_frame]u8 = undefined;
     var out: [cmdu.max_frame]u8 = undefined;
     var tlv_buf: [300]u8 = undefined;
-    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific, .topology_notification, .ap_capability_report, .assoc_sta_link_metrics_response };
+    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific, .topology_notification, .ap_capability_report, .assoc_sta_link_metrics_response, .client_steering_btm_report, .steering_completed };
     for (0..5000) |i| {
         const n = rand.uintAtMost(usize, tlv_buf.len);
         rand.bytes(tlv_buf[0..n]);

@@ -128,7 +128,12 @@ config controller 'main'
 	# Open the router's WPS window when a known satellite lost power and is
 	# searching (see README for the security trade-off).
 	option auto_wps '1'
+	# Suggest a better router to clients (802.11v). Needs one shared name
+	# (ssid_suffix ''), since clients only move between BSSes of one network.
+	option steering '0'
 ```
+
+With `steering '1'`, a device on the satellite that the router hears at least 10 dB better gets asked (through the satellite) to move to the router, and a device on the router's 5 GHz that stays below -75 dBm for 20 seconds gets the satellite suggested. It's a suggestion, never a kick: the device can say no. Each device is moved at most once every 5 minutes so it can't bounce. The satellite can't measure devices it isn't serving, so the second direction relies on the device's own scan. While steering is on, the router's 5 GHz and 2.4 GHz networks announce 802.11v support until the next Wi-Fi reload, when meshkeeper turns it back on.
 
 Set `fronthaul_2g` and `fronthaul_5g` to your own wireless section names. A fresh OpenWrt usually has `default_radio0` and `default_radio1`, and `uci show wireless | grep =wifi-iface` lists yours. With a wrong name it logs "wireless section not found" and pushes nothing. The sections need a name; an anonymous `config wifi-iface` can't be picked.
 
@@ -136,7 +141,7 @@ Run `meshkeeper --observe` to watch the traffic without sending anything, openin
 
 ## Security
 
-It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. It reads its own config and `wireless` straight from `/etc/config` as that user, so the root-only configs (network with your WAN login, system, dhcp, uhttpd, rpcd, dropbear) stay out of its reach. `wireless` is readable by every user on stock OpenWrt anyway. Over ubus it can only read the wireless status and call three hostapd methods (`notify_response`, `del_client`, `wps_start`), nothing else. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
+It runs as its own `meshkeeper` user inside ujail, with only `CAP_NET_RAW` and no way to gain more. It reads its own config and `wireless` straight from `/etc/config` as that user, so the root-only configs (network with your WAN login, system, dhcp, uhttpd, rpcd, dropbear) stay out of its reach. `wireless` is readable by every user on stock OpenWrt anyway. Over ubus it can only read the wireless status and call seven hostapd methods (`notify_response`, `del_client`, `wps_start`, and for steering `get_status`, `get_clients`, `bss_mgmt_enable`, `bss_transition_request`), nothing else. Parsers never trust a length field and are fuzz tested, and release binaries keep Zig's safety checks on, so a bad frame is an error or a clean restart by procd, not memory corruption.
 
 The honest trade-off is auto-WPS. Its trigger is a probe request from the satellite's backhaul MAC, and anyone nearby can fake a MAC. On its own that isn't enough: the real satellite also has to stop talking on the LAN for a minute, which takes a power cut or jamming. But if someone pulls that off, the router opens WPS and any device that presses its own WPS button inside those 2 minutes joins your Wi-Fi, which means LAN access. If that's not a risk you want, set `auto_wps '0'` and open WPS by hand after a power cut.
 
@@ -155,7 +160,7 @@ The second line gives `zig-out/bin/meshkeeper` for ath79 (MIPS 24Kc). Change the
 
 ## Limits
 
-One satellite tested, 5 GHz backhaul only, up to 4 satellites in the table. Multi-AP profile 1, no band steering or client roaming help, and the satellite's networks get WPA2. Messages that need fragmenting aren't supported, none of the ones the AX12 sends did.
+One satellite tested, 5 GHz backhaul only, up to 4 satellites in the table. Multi-AP profile 1, steering between routers but not between bands, and the satellite's networks get WPA2. Messages that need fragmenting aren't supported, none of the ones the AX12 sends did.
 
 ## License
 

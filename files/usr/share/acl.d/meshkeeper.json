@@ -5,7 +5,7 @@
 			"methods": [ "status" ]
 		},
 		"hostapd.*": {
-			"methods": [ "notify_response", "del_client", "wps_start" ]
+			"methods": [ "notify_response", "del_client", "wps_start", "get_status", "get_clients", "bss_mgmt_enable", "bss_transition_request" ]
 		}
 	},
 	"subscribe": [ "hostapd.*" ]

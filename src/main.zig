@@ -65,6 +65,7 @@ const state_path = state_dir ++ "/state";
 const mesh_dir = "/var/run/meshkeeper";
 const mesh_path = mesh_dir ++ "/mesh.json";
 const mesh_every_ms = 5 * std.time.ms_per_s;
+const local_every_ms = 5 * std.time.ms_per_s;
 const resubscribe_after_ms = 5 * std.time.ms_per_s;
 const packet_outgoing = 4; // linux/if_packet.h PACKET_OUTGOING
 
@@ -78,6 +79,17 @@ const Settings = struct {
     wps_object: ?[]const u8,
     /// Every hostapd object, for probe events and dropping stale stations.
     hostapd_objects: []const []const u8,
+    steering: bool,
+    /// The router's fronthaul BSSes and their hostapd objects, same order.
+    local: []const controller.LocalBss,
+    local_objects: []const []const u8,
+
+    fn localIndex(s: Settings, ifname: []const u8) ?u8 {
+        for (s.local_objects, 0..) |obj, i| {
+            if (std.mem.eql(u8, obj["hostapd.".len..], ifname)) return @intCast(i);
+        }
+        return null;
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -114,10 +126,12 @@ pub fn main(init: std.process.Init) !void {
         .al_mac = sock.mac,
         .fronthaul = settings.fronthaul,
         .auto_wps = settings.auto_wps and !observe,
+        .steering = settings.steering,
+        .local = settings.local,
     }, first_mid);
     loadState(init.gpa, io, &ctl);
 
-    log.info("controller {x} on {s}{s}, auto-WPS {s}", .{ sock.mac, settings.interface, if (observe) " (observe only)" else "", if (ctl.cfg.auto_wps) "on" else "off" });
+    log.info("controller {x} on {s}{s}, auto-WPS {s}, steering {s}", .{ sock.mac, settings.interface, if (observe) " (observe only)" else "", if (ctl.cfg.auto_wps) "on" else "off", if (ctl.cfg.steering) "on" else "off" });
     for (settings.fronthaul, [_][]const u8{ "2.4", "5" }) |bss, band| {
         if (bss) |b| log.info("  {s} GHz agent radios get \"{s}\"", .{ band, b.ssid });
     }
@@ -126,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
     defer probes.stop(io);
     var resubscribe_at: i64 = 0;
     var mesh_at: i64 = 0;
+    var local_at: i64 = 0;
     var mesh_failing = false; // log a failing write once, not every 5 s into logd's small ring
 
     var rx: [cmdu.max_frame]u8 = undefined;
@@ -140,6 +155,9 @@ pub fn main(init: std.process.Init) !void {
                 settings_arena = fresh;
                 settings = s;
                 ctl.cfg.fronthaul = settings.fronthaul;
+                ctl.cfg.steering = settings.steering;
+                ctl.setLocal(settings.local);
+                if (settings.steering and !observe) enableBtm(init.gpa, io, settings);
             } else |err| {
                 fresh.deinit();
                 log.warn("reloading settings failed ({t}), keeping the old ones", .{err});
@@ -169,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (fds[1].revents != 0) {
-            if (!probes.drain(&ctl, now)) {
+            if (!probes.drain(&ctl, settings, now)) {
                 probes.stop(io);
                 resubscribe_at = now + resubscribe_after_ms;
                 log.info("hostapd subscription ended (Wi-Fi reload?), resubscribing", .{});
@@ -182,6 +200,12 @@ pub fn main(init: std.process.Init) !void {
         };
         if (t.frame) |frame| send(sock, observe, frame);
         if (t.wps) |w| openWps(init.gpa, io, settings, w);
+        if (t.btm) |b| suggestMove(init.gpa, io, settings, observe, b);
+
+        if (settings.steering and now >= local_at) {
+            local_at = now + local_every_ms;
+            pollLocalClients(init.gpa, io, settings, &ctl, now);
+        }
 
         if (ctl.dirty) {
             // Observe mode has no side effects, flash writes included.
@@ -321,34 +345,100 @@ const ProbeFeed = struct {
 
     /// One read per poll wakeup (poll said it is readable, so it can't block).
     /// False once the subscription ended.
-    fn drain(feed: *ProbeFeed, ctl: *Controller, now: i64) bool {
+    fn drain(feed: *ProbeFeed, ctl: *Controller, settings: Settings, now: i64) bool {
         if (feed.len == feed.line.len) feed.len = 0; // oversized line: drop it
         const n = posix.read(feed.child.?.stdout.?.handle, feed.line[feed.len..]) catch return false;
         if (n == 0) return false;
         feed.len += n;
         while (std.mem.indexOfScalar(u8, feed.line[0..feed.len], '\n')) |nl| {
-            handleEvent(feed.line[0..nl], ctl, now);
+            handleEvent(feed.line[0..nl], ctl, settings, now);
             std.mem.copyForwards(u8, feed.line[0..], feed.line[nl + 1 .. feed.len]);
             feed.len -= nl + 1;
         }
         return true;
     }
 
-    fn handleEvent(line: []const u8, ctl: *Controller, now: i64) void {
+    fn handleEvent(line: []const u8, ctl: *Controller, settings: Settings, now: i64) void {
         // Probes arrive often (every client scan); parse without touching the heap.
         var scratch: [4096]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&scratch);
-        const Event = struct { probe: ?struct { address: []const u8 } = null };
+        const Event = struct { probe: ?struct { address: []const u8, ifname: []const u8 = "", signal: ?i32 = null } = null };
         const ev = std.json.parseFromSliceLeaky(Event, fba.allocator(), line, .{ .ignore_unknown_fields = true }) catch return;
         const probe = ev.probe orelse return;
-        var mac: cmdu.Mac = undefined;
-        var hex: [12]u8 = undefined;
-        if (probe.address.len != 17) return;
-        for (0..6) |k| hex[k * 2 ..][0..2].* = probe.address[k * 3 ..][0..2].*;
-        _ = std.fmt.hexToBytes(&mac, &hex) catch return;
-        ctl.onProbe(mac, now);
+        const mac = parseMacText(probe.address) orelse return;
+        const heard: ?controller.Heard = if (settings.localIndex(probe.ifname)) |bss| (if (probe.signal) |sig|
+            .{ .bss = bss, .rssi = std.math.lossyCast(i8, sig), .at = now }
+        else
+            null) else null;
+        ctl.onProbe(mac, now, heard);
     }
 };
+
+/// "aa:bb:cc:dd:ee:ff", either case.
+fn parseMacText(text: []const u8) ?cmdu.Mac {
+    if (text.len != 17) return null;
+    var hex: [12]u8 = undefined;
+    for (0..6) |k| hex[k * 2 ..][0..2].* = text[k * 3 ..][0..2].*;
+    var mac: cmdu.Mac = undefined;
+    _ = std.fmt.hexToBytes(&mac, &hex) catch return null;
+    return mac;
+}
+
+/// Lets clients see the router supports 802.11v (runtime only; a Wi-Fi reload
+/// undoes it and the next settings reload redoes it).
+fn enableBtm(gpa: Allocator, io: Io, s: Settings) void {
+    for (s.local_objects) |obj| {
+        const r = ubus(gpa, io, &.{ "call", obj, "bss_mgmt_enable", "{\"bss_transition\":true}" }) catch |err| {
+            log.warn("bss_mgmt_enable on {s} failed: {t}", .{ obj, err });
+            continue;
+        };
+        gpa.free(r);
+    }
+}
+
+fn suggestMove(gpa: Allocator, io: Io, s: Settings, observe: bool, b: controller.Btm) void {
+    const obj = s.local_objects[b.bss];
+    // Neighbor Report body: BSSID, BSSID info (reachable, secure, same keys), op class, channel, PHY type VHT.
+    var nr: [13]u8 = undefined;
+    nr[0..6].* = b.target.bssid;
+    nr[6..10].* = .{ 0x0f, 0, 0, 0 };
+    nr[10] = b.target.op_class;
+    nr[11] = b.target.channel;
+    nr[12] = 9;
+    var arg_buf: [256]u8 = undefined;
+    const arg = std.fmt.bufPrint(&arg_buf, "{{\"addr\":\"{s}\",\"disassociation_imminent\":false,\"abridged\":true,\"validity_period\":30,\"neighbors\":[\"{s}\"]}}", .{ &controller.macText(b.sta), &std.fmt.bytesToHex(nr, .lower) }) catch unreachable;
+    if (observe) {
+        log.info("observe: would call {s} bss_transition_request {s}", .{ obj, arg });
+        return;
+    }
+    const r = ubus(gpa, io, &.{ "call", obj, "bss_transition_request", arg }) catch |err| {
+        log.warn("bss_transition_request to {x} on {s} failed: {t}", .{ b.sta, obj, err });
+        return;
+    };
+    gpa.free(r);
+}
+
+fn pollLocalClients(gpa: Allocator, io: Io, s: Settings, ctl: *Controller, now: i64) void {
+    var list: [controller.max_clients]controller.LocalClient = undefined;
+    var n: usize = 0;
+    for (s.local_objects, 0..) |obj, bss| {
+        const raw = ubus(gpa, io, &.{ "call", obj, "get_clients" }) catch continue;
+        defer gpa.free(raw);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const Clients = struct { clients: std.json.ArrayHashMap(struct { signal: ?i32 = null }) = .{} };
+        const parsed = std.json.parseFromSliceLeaky(Clients, arena.allocator(), raw, .{ .ignore_unknown_fields = true }) catch continue;
+        var it = parsed.clients.map.iterator();
+        while (it.next()) |e| {
+            if (n == list.len) break;
+            const mac = parseMacText(e.key_ptr.*) orelse continue;
+            const sig = e.value_ptr.signal orelse continue;
+            list[n] = .{ .mac = mac, .bss = @intCast(bss), .rssi = std.math.lossyCast(i8, sig) };
+            n += 1;
+        }
+    }
+    ctl.setLocalClients(list[0..n], now);
+}
 
 fn openWps(gpa: Allocator, io: Io, s: Settings, w: controller.WpsAction) void {
     var arg_buf: [128]u8 = undefined;
@@ -392,6 +482,8 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
     const suffix = main_section.get("ssid_suffix") orelse "";
     var fronthaul: [2]?wsc.Bss = .{ null, null };
     var wps_object: ?[]const u8 = null;
+    var local: std.ArrayList(controller.LocalBss) = .empty;
+    var local_objects: std.ArrayList([]const u8) = .empty;
     for ([_][]const u8{ "fronthaul_2g", "fronthaul_5g" }, 0..) |key, band| {
         const section = main_section.get(key) orelse continue;
         const iface = wifi.section(section) orelse {
@@ -407,7 +499,12 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
         const full_ssid = try std.mem.concat(arena, u8, &.{ ssid, suffix });
         if (full_ssid.len > 32) return error.SsidTooLong;
         fronthaul[band] = .{ .ssid = full_ssid, .passphrase = passphrase };
-        if (band == 1) wps_object = try hostapdObject(arena, status, section);
+        const obj = try hostapdObject(arena, status, section) orelse continue;
+        if (band == 1) wps_object = obj;
+        if (localBss(arena, gpa, io, obj)) |bss| {
+            try local.append(arena, bss);
+            try local_objects.append(arena, obj);
+        } else |err| log.warn("{s} get_status: {t}", .{ obj, err });
     }
 
     var objects: std.ArrayList([]const u8) = .empty;
@@ -422,6 +519,22 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
         .auto_wps = std.mem.eql(u8, main_section.get("auto_wps") orelse "0", "1"),
         .wps_object = wps_object,
         .hostapd_objects = objects.items,
+        .steering = std.mem.eql(u8, main_section.get("steering") orelse "0", "1"),
+        .local = local.items,
+        .local_objects = local_objects.items,
+    };
+}
+
+fn localBss(arena: Allocator, gpa: Allocator, io: Io, obj: []const u8) !controller.LocalBss {
+    const raw = try ubus(gpa, io, &.{ "call", obj, "get_status" });
+    defer gpa.free(raw);
+    const Status = struct { bssid: []const u8, freq: u32, channel: u8, op_class: u8 };
+    const st = try std.json.parseFromSliceLeaky(Status, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    return .{
+        .bssid = parseMacText(st.bssid) orelse return error.BadBssid,
+        .band = .fromMhz(st.freq),
+        .op_class = st.op_class,
+        .channel = st.channel,
     };
 }
 
