@@ -1,0 +1,14 @@
+[project]
+name = "multiap-proto"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography>=50.0.2",
+    "scapy>=2.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
