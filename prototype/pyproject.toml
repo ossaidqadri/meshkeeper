@@ -1,7 +1,7 @@
 [project]
 name = "meshkeeper-proto"
 version = "0.1.0"
-description = "Add your description here"
+description = "Python prototype of meshkeeper and generator of its WSC test vectors"
 requires-python = ">=3.13"
 dependencies = [
     "cryptography>=50.0.2",
