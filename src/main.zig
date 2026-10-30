@@ -362,8 +362,8 @@ const ProbeFeed = struct {
         // Probes arrive often (every client scan); parse without touching the heap.
         var scratch: [4096]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&scratch);
-        const Event = struct { probe: ?struct { address: []const u8, ifname: []const u8 = "", signal: ?i32 = null } = null };
-        const ev = std.json.parseFromSliceLeaky(Event, fba.allocator(), line, .{ .ignore_unknown_fields = true }) catch return;
+        const ev = parseEvent(fba.allocator(), line) catch return;
+        if (ev.@"bss-transition-response") |r| if (parseMacText(r.address)) |sta| ctl.onBtmAnswer(sta, r.@"status-code");
         const probe = ev.probe orelse return;
         const mac = parseMacText(probe.address) orelse return;
         const heard: ?controller.Heard = if (settings.localIndex(probe.ifname)) |bss| (if (probe.signal) |sig|
@@ -426,18 +426,63 @@ fn pollLocalClients(gpa: Allocator, io: Io, s: Settings, ctl: *Controller, now: 
         defer gpa.free(raw);
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
-        const Clients = struct { clients: std.json.ArrayHashMap(struct { signal: ?i32 = null }) = .{} };
-        const parsed = std.json.parseFromSliceLeaky(Clients, arena.allocator(), raw, .{ .ignore_unknown_fields = true }) catch continue;
-        var it = parsed.clients.map.iterator();
-        while (it.next()) |e| {
-            if (n == list.len) break;
-            const mac = parseMacText(e.key_ptr.*) orelse continue;
-            const sig = e.value_ptr.signal orelse continue;
-            list[n] = .{ .mac = mac, .bss = @intCast(bss), .rssi = std.math.lossyCast(i8, sig) };
-            n += 1;
-        }
+        n += parseClients(arena.allocator(), raw, @intCast(bss), list[n..]) catch continue;
     }
     ctl.setLocalClients(list[0..n], now);
+}
+
+/// hostapd `get_clients` output into `out`; returns how many were filled.
+fn parseClients(arena: Allocator, raw: []const u8, bss: u8, out: []controller.LocalClient) !usize {
+    const Clients = struct { clients: std.json.ArrayHashMap(struct { signal: ?i32 = null, extended_capabilities: []const u8 = &.{} }) = .{} };
+    const parsed = try std.json.parseFromSliceLeaky(Clients, arena, raw, .{ .ignore_unknown_fields = true });
+    var n: usize = 0;
+    var it = parsed.clients.map.iterator();
+    while (it.next()) |e| {
+        if (n == out.len) break;
+        const mac = parseMacText(e.key_ptr.*) orelse continue;
+        const sig = e.value_ptr.signal orelse continue;
+        // Extended Capabilities bit 19: BSS Transition (802.11v).
+        const caps = e.value_ptr.extended_capabilities;
+        const btm = caps.len > 2 and caps[2] & 0x08 != 0;
+        out[n] = .{ .mac = mac, .bss = bss, .rssi = std.math.lossyCast(i8, sig), .btm = btm };
+        n += 1;
+    }
+    return n;
+}
+
+const Event = struct {
+    probe: ?struct { address: []const u8, ifname: []const u8 = "", signal: ?i32 = null } = null,
+    @"bss-transition-response": ?struct { address: []const u8, @"status-code": u8 } = null,
+};
+
+fn parseEvent(fba: Allocator, line: []const u8) !Event {
+    return std.json.parseFromSliceLeaky(Event, fba, line, .{ .ignore_unknown_fields = true });
+}
+
+test "hostapd output as captured on the C6" {
+    var buf: [8192]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const clients =
+        \\{"freq":5745,"clients":{"02:00:00:00:c0:de":{"auth":true,"rrm":[114,0,0,0,0],
+        \\"extended_capabilities":[4,0,136,128,1,64,0,192,0,0],"aid":1,"rate":{"rx":2170000,"tx":19510000},"signal":-74},
+        \\"02:00:00:00:00:01":{"extended_capabilities":[4,0,0],"signal":-50},"02:00:00:00:00:02":{"auth":true}}}
+    ;
+    var list: [4]controller.LocalClient = undefined;
+    const n = try parseClients(fba.allocator(), clients, 0, &list);
+    try std.testing.expectEqual(2, n);
+    try std.testing.expectEqual(-74, list[0].rssi);
+    try std.testing.expect(list[0].btm);
+    try std.testing.expect(!list[1].btm);
+
+    const probe = try parseEvent(fba.allocator(),
+        \\{ "probe": {"address":"02:00:00:00:be:ef","ifname":"phy1-ap0","target":"ff:ff:ff:ff:ff:ff","signal":-62,"freq":2412,"ht_capabilities":{"ht_capabilities_info":11520}} }
+    );
+    try std.testing.expectEqual(-62, probe.probe.?.signal.?);
+    try std.testing.expectEqualStrings("phy1-ap0", probe.probe.?.ifname);
+    const answer = try parseEvent(fba.allocator(),
+        \\{ "bss-transition-response": {"address":"02:00:00:00:c0:de","dialog-token":1,"status-code":1,"bss-termination-delay":0} }
+    );
+    try std.testing.expectEqual(1, answer.@"bss-transition-response".?.@"status-code");
 }
 
 fn openWps(gpa: Allocator, io: Io, s: Settings, w: controller.WpsAction) void {

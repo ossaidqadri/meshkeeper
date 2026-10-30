@@ -30,6 +30,8 @@ pub const MsgType = enum(u16) {
     ap_capability_report = 0x8002,
     assoc_sta_link_metrics_query = 0x800D,
     assoc_sta_link_metrics_response = 0x800E,
+    beacon_metrics_query = 0x8011,
+    beacon_metrics_response = 0x8012,
     client_steering_request = 0x8014,
     client_steering_btm_report = 0x8015,
     steering_completed = 0x8017,
@@ -54,6 +56,8 @@ pub const Tlv = enum(u8) {
     client_association_event = 0x92,
     sta_mac_address = 0x95,
     associated_sta_link_metrics = 0x96,
+    beacon_metrics_query = 0x99,
+    beacon_metrics_response = 0x9A,
     steering_request = 0x9B,
     steering_btm_report = 0x9C,
     ap_capability = 0xA1,
@@ -330,7 +334,89 @@ pub const BtmReport = struct {
     }
 };
 
+/// Beacon Metrics Query TLV value (layout as in prplMesh tlvf): asks the agent
+/// to have its client measure every BSS it hears on one channel (802.11k), with
+/// wildcard BSSID and SSID, no reporting detail.
+pub fn beaconQuery(sta: Mac, op_class: u8, channel: u8) [18]u8 {
+    var v: [18]u8 = undefined;
+    v[0..6].* = sta;
+    v[6] = op_class;
+    v[7] = channel;
+    v[8..14].* = @splat(0xff);
+    v[14..18].* = .{ 0, 0, 0, 0 }; // reporting detail, SSID length, AP channel reports, element IDs
+    return v;
+}
+
+/// 802.11 global operating class of a 20 MHz channel, as 802.11k measurement
+/// requests use; null for channels this controller doesn't know.
+pub fn opClass20(channel: u8) ?u8 {
+    return switch (channel) {
+        1...13 => 81,
+        36...48 => 115,
+        52...64 => 118,
+        100...144 => 121,
+        149...165 => 125,
+        else => null,
+    };
+}
+
+pub const BeaconReport = struct { bssid: Mac, rssi: ?i8 };
+
+/// Beacon Metrics Response TLV: the client, then raw 802.11 Measurement Report
+/// elements; yields the beacon reports (type 5) among them.
+pub const BeaconReports = struct {
+    sta: Mac,
+    r: Io.Reader,
+    left: u8,
+
+    pub fn init(value: []const u8) ParseError!BeaconReports {
+        var r: Io.Reader = .fixed(value);
+        const sta = (r.takeArray(6) catch return error.Truncated).*;
+        r.discardAll(1) catch return error.Truncated;
+        const n = r.takeByte() catch return error.Truncated;
+        return .{ .sta = sta, .r = r, .left = n };
+    }
+
+    pub fn next(it: *BeaconReports) ParseError!?BeaconReport {
+        const eid_measurement_report = 39;
+        const type_beacon = 5;
+        while (it.left > 0) {
+            it.left -= 1;
+            const eid = it.r.takeByte() catch return error.Truncated;
+            const len = it.r.takeByte() catch return error.Truncated;
+            const body = it.r.take(len) catch return error.Truncated;
+            // token, mode, type, then op class(1) channel(1) start(8) duration(2)
+            // frame info(1) RCPI(1) RSNI(1) BSSID(6) ...
+            if (eid != eid_measurement_report or body.len < 3 + 21 or body[2] != type_beacon) continue;
+            const b = body[3..];
+            return .{ .bssid = b[15..21].*, .rssi = rcpiToDbm(b[13]) };
+        }
+        return null;
+    }
+};
+
 const testing = std.testing;
+
+test "beacon query and report" {
+    const q = beaconQuery(.{ 2, 2, 2, 2, 2, 2 }, 125, 149);
+    try testing.expectEqualSlices(u8, &([_]u8{ 2, 2, 2, 2, 2, 2, 125, 149, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 }), &q);
+    try testing.expectEqual(@as(?u8, 125), opClass20(149));
+    try testing.expectEqual(@as(?u8, null), opClass20(14));
+
+    // Two beacon reports (RCPI 100 = -60 dBm, 80 = -70 dBm) and one other element.
+    const head = [_]u8{ 2, 2, 2, 2, 2, 2, 0, 3 };
+    const z11: [11]u8 = @splat(0); // start time, duration, frame info
+    const z5: [5]u8 = @splat(0); // antenna, parent TSF
+    const rep1 = [_]u8{ 39, 3 + 26, 1, 0, 5, 125, 149 } ++ z11 ++ [_]u8{ 100, 0, 3, 3, 3, 3, 3, 3 } ++ z5;
+    const other = [_]u8{ 221, 2, 0, 0 };
+    const rep2 = [_]u8{ 39, 3 + 26, 2, 0, 5, 125, 149 } ++ z11 ++ [_]u8{ 80, 0, 4, 4, 4, 4, 4, 4 } ++ z5;
+    var it: BeaconReports = try .init(&(head ++ rep1 ++ other ++ rep2));
+    const a = (try it.next()).?;
+    try testing.expectEqualSlices(u8, &.{ 3, 3, 3, 3, 3, 3 }, &a.bssid);
+    try testing.expectEqual(@as(?i8, -60), a.rssi);
+    try testing.expectEqual(@as(?i8, -70), (try it.next()).?.rssi);
+    try testing.expectEqual(null, try it.next());
+}
 
 test "steering request layout" {
     const v = steeringRequest(.{ 1, 1, 1, 1, 1, 1 }, .{ 2, 2, 2, 2, 2, 2 }, .{ .bssid = .{ 3, 3, 3, 3, 3, 3 }, .op_class = 128, .channel = 149 });
@@ -431,6 +517,10 @@ test "fuzz: random and truncated frames never crash the parsers" {
                 },
                 .client_association_event => _ = AssociationEvent.parse(e.value) catch {},
                 .steering_btm_report => _ = BtmReport.parse(e.value) catch {},
+                .beacon_metrics_response => {
+                    var br = BeaconReports.init(e.value) catch continue;
+                    while (br.next() catch null) |_| {}
+                },
                 else => {},
             }
         }

@@ -19,6 +19,9 @@ start_service() {
 
 	procd_open_instance
 	procd_set_param command "$PROG"
+	# procd restarts the instance only when its parameters change; listing the
+	# config file makes `uci commit meshkeeper` + reload_config apply it.
+	procd_set_param file /etc/config/meshkeeper
 	# Boot can race br-lan/rpcd; keep retrying instead of giving up.
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1

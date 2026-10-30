@@ -12,14 +12,16 @@
 //!   a minute, and windows are rate limited per outage.
 //!
 //! Steering (with `steering`), usteer-style, never forcing a client off:
-//! - Agent client: steered to a router BSS on the same band when the router
-//!   hears its probes `steer_margin` dB better than the agent hears it.
-//!   EasyMesh Client Steering Request; the agent sends the 802.11v request.
+//! - Agent client the agent hears weakly: steered to a router BSS on the same
+//!   band when that is `steer_margin` dB better, by the client's own beacon
+//!   report (EasyMesh Beacon Metrics Query) or, failing that, by the router
+//!   hearing its probes. EasyMesh Client Steering Request; the agent sends the
+//!   802.11v request.
 //! - Router client: the agent can't measure clients it doesn't serve (AX12),
 //!   so a router client that stays weak on 5 GHz gets an 802.11v suggestion
 //!   for the agent's 5 GHz BSS and decides from its own scan.
 //! - One steer per client per `steer_hold`, in either direction, so a client
-//!   can't ping-pong.
+//!   can't ping-pong; every refusal doubles that client's hold.
 
 const std = @import("std");
 const cmdu = @import("cmdu.zig");
@@ -55,6 +57,11 @@ pub const timing = struct {
     /// A router client must stay below `steer_weak` this long before a suggestion.
     pub const weak_for: Ms = 20 * std.time.ms_per_s;
     pub const steer_hold: Ms = 5 * std.time.ms_per_min;
+    /// A weak agent client gets asked how it hears the routers this often
+    /// (each answer costs the client a short scan).
+    pub const beacon_interval: Ms = 60 * std.time.ms_per_s;
+    /// Each refused move doubles the hold, up to `steer_hold << max_backoff`.
+    pub const max_backoff = 4;
 };
 
 pub const steer_margin: i8 = 10;
@@ -77,14 +84,20 @@ pub const LocalBss = struct {
     }
 };
 
-/// How a router BSS hears a station: index into `Config.local`, signal in dBm.
-pub const Heard = struct { bss: u8, rssi: i8, at: Ms };
+/// A router BSS and an agent client, compared: index into `Config.local` and
+/// its signal in dBm. From a probe, `rssi` is how the router hears the client
+/// (compare with the agent's link metrics). From a beacon report it is how the
+/// client hears the router, and `serving` how it hears the agent, so both
+/// sides are measured the same way.
+pub const Heard = struct { bss: u8, rssi: i8, at: Ms, serving: ?i8 = null };
 
 /// A client of the router itself, from hostapd's client list.
 pub const LocalClient = struct {
     mac: Mac,
     bss: u8,
     rssi: i8,
+    /// Advertises 802.11v BSS transition; a suggestion is wasted otherwise.
+    btm: bool = true,
     weak_since: ?Ms = null,
 };
 
@@ -100,8 +113,9 @@ pub const Client = struct {
     downlink_mbps: u32 = 0,
     uplink_mbps: u32 = 0,
     metrics_at: ?Ms = null,
-    /// Best recent probe a router BSS on the same band heard from it.
+    /// Best recent reading of a router BSS on the same band.
     heard: ?Heard = null,
+    beacon_query_at: ?Ms = null,
 };
 
 /// Credentials digest, so a password change is detected without storing it.
@@ -264,6 +278,13 @@ pub const WpsAction = struct {
     window: u8,
 };
 
+const Steered = struct {
+    mac: Mac = @splat(0),
+    at: ?Ms = null,
+    /// Moves this client refused in a row.
+    refused: u8 = 0,
+};
+
 pub const Controller = struct {
     cfg: Config,
     agents: [max_agents]Agent = undefined,
@@ -274,7 +295,7 @@ pub const Controller = struct {
     local_clients: [max_clients]LocalClient = undefined,
     n_local: u8 = 0,
     /// Recently steered clients, oldest overwritten first.
-    steered: [16]struct { mac: Mac, at: ?Ms } = @splat(.{ .mac = @splat(0), .at = null }),
+    steered: [16]Steered = @splat(.{}),
     next_steered: u8 = 0,
 
     pub fn init(cfg: Config, first_mid: u16) Controller {
@@ -365,11 +386,13 @@ pub const Controller = struct {
                 learnLinkMetrics(a, f, now);
                 return null;
             },
-            // The agent waits for a 1905 ACK on both, and retries without one.
-            .client_steering_btm_report, .steering_completed => {
+            // The agent waits for a 1905 ACK on these, and retries without one.
+            .client_steering_btm_report, .steering_completed, .beacon_metrics_response => {
                 if (f.find(.steering_btm_report)) |v| if (cmdu.BtmReport.parse(v)) |r| {
                     log.info("agent {x}: client {x} {s} the move (BTM status {d})", .{ a.al_mac, r.sta, if (r.status == 0) "accepted" else "declined", r.status });
+                    c.onBtmAnswer(r.sta, r.status);
                 } else |_| {};
+                if (f.find(.beacon_metrics_response)) |v| c.learnBeacons(a, v, now);
                 return try cmdu.build(out, f.src, c.cfg.al_mac, .ack, f.mid, &.{});
             },
             .ap_autoconfig_wsc => return c.answerM1(a, f, now, out, secrets),
@@ -509,8 +532,11 @@ pub const Controller = struct {
             const cl = a.client(sta) orelse continue;
             // Only a BSS the client could move to: same band, same network.
             if (a.bandOf(cl.bssid) != c.cfg.local[h.bss].band) continue;
-            const old = cl.heard;
-            if (old == null or now - old.?.at > timing.reading_fresh or h.rssi >= old.?.rssi) cl.heard = h;
+            if (cl.heard) |old| if (now - old.at <= timing.reading_fresh) {
+                // A fresh beacon report compares like with like; a probe doesn't replace it.
+                if (old.serving != null or h.rssi < old.rssi) continue;
+            };
+            cl.heard = h;
         }
     }
 
@@ -548,17 +574,78 @@ pub const Controller = struct {
         return if (c.cfg.steering == .log) "would be " else "";
     }
 
-    fn recentlySteered(c: *const Controller, sta: Mac, now: Ms) bool {
-        for (c.steered) |s| {
-            const at = s.at orelse continue;
-            if (std.mem.eql(u8, &s.mac, &sta) and now - at < timing.steer_hold) return true;
-        }
-        return false;
+    fn steeredEntry(c: *Controller, sta: Mac) ?*Steered {
+        for (&c.steered) |*s| if (s.at != null and std.mem.eql(u8, &s.mac, &sta)) return s;
+        return null;
+    }
+
+    fn recentlySteered(c: *Controller, sta: Mac, now: Ms) bool {
+        const s = c.steeredEntry(sta) orelse return false;
+        const hold = timing.steer_hold << @min(s.refused, timing.max_backoff);
+        return now - s.at.? < hold;
     }
 
     fn noteSteer(c: *Controller, sta: Mac, now: Ms) void {
+        if (c.steeredEntry(sta)) |s| {
+            s.at = now;
+            return;
+        }
         c.steered[c.next_steered] = .{ .mac = sta, .at = now };
         c.next_steered = (c.next_steered + 1) % @as(u8, c.steered.len);
+    }
+
+    /// A client's answer to a move (802.11v BTM status, 0 = accept), reported
+    /// by the router's hostapd or by the agent. Refusals back off.
+    pub fn onBtmAnswer(c: *Controller, sta: Mac, status: u8) void {
+        const s = c.steeredEntry(sta) orelse return;
+        if (status == 0) {
+            s.refused = 0;
+            return;
+        }
+        s.refused +|= 1;
+        log.info("client {x} refused the move ({d} in a row), next try in {d} min", .{ sta, s.refused, @divTrunc(timing.steer_hold << @min(s.refused, timing.max_backoff), std.time.ms_per_min) });
+    }
+
+    /// Asks a weak agent client, through the agent, how it hears the router
+    /// and the agent (EasyMesh Beacon Metrics Query, 802.11k on the client).
+    /// The router's own probe events are rare: its radio answers most probes
+    /// in firmware.
+    fn queryBeacons(c: *Controller, a: *Agent, now: Ms, out: []u8) !?[]const u8 {
+        for (a.clients[0..a.n_clients]) |*cl| {
+            const rssi = cl.rssi orelse continue;
+            const measured = cl.metrics_at orelse continue;
+            if (now - measured > timing.reading_fresh or rssi >= agent_weak) continue;
+            if (cl.beacon_query_at) |t| if (now - t < timing.beacon_interval) continue;
+            if (c.recentlySteered(cl.mac, now)) continue;
+            const band = a.bandOf(cl.bssid) orelse continue;
+            const local = for (c.cfg.local) |l| (if (l.band == band) break l) else continue;
+            const op_class = cmdu.opClass20(local.channel) orelse continue;
+            cl.beacon_query_at = now;
+            const q = cmdu.beaconQuery(cl.mac, op_class, local.channel);
+            return try cmdu.build(out, a.al_mac, c.cfg.al_mac, .beacon_metrics_query, c.mid(), &.{
+                .{ .type = .beacon_metrics_query, .value = &q },
+            });
+        }
+        return null;
+    }
+
+    fn learnBeacons(c: *Controller, a: *Agent, v: []const u8, now: Ms) void {
+        var it = cmdu.BeaconReports.init(v) catch return;
+        const cl = a.client(it.sta) orelse return;
+        var heard: ?Heard = null;
+        var serving: ?i8 = null;
+        while (it.next() catch null) |r| {
+            const rssi = r.rssi orelse continue;
+            if (std.mem.eql(u8, &r.bssid, &cl.bssid)) serving = rssi;
+            for (c.cfg.local, 0..) |l, i| if (std.mem.eql(u8, &l.bssid, &r.bssid)) {
+                heard = .{ .bss = @intCast(i), .rssi = rssi, .at = now };
+            };
+        }
+        var h = heard orelse return;
+        h.serving = serving orelse return; // two readings the same way, or none
+        // Debug: a weak client sitting still would log this every query.
+        log.debug("client {x} hears router {d} dBm, agent {x} {d} dBm", .{ cl.mac, h.rssi, a.al_mac, h.serving.? });
+        cl.heard = h;
     }
 
     /// An agent client the router hears clearly better: steering request frame.
@@ -571,11 +658,12 @@ pub const Controller = struct {
             const h = cl.heard orelse continue;
             const measured = cl.metrics_at orelse continue;
             if (now - measured > timing.reading_fresh or now - h.at > timing.reading_fresh) continue;
-            if (rssi >= agent_weak or @as(i16, h.rssi) - rssi < steer_margin or c.recentlySteered(cl.mac, now)) continue;
+            const here = h.serving orelse rssi;
+            if (rssi >= agent_weak or @as(i16, h.rssi) - here < steer_margin or c.recentlySteered(cl.mac, now)) continue;
             c.noteSteer(cl.mac, now);
             cl.heard = null;
             const target = c.cfg.local[h.bss].target();
-            log.info("{s}steering {x} from agent {x} ({d} dBm) to router {x} ({d} dBm)", .{ c.wouldPrefix(), cl.mac, a.al_mac, rssi, target.bssid, h.rssi });
+            log.info("{s}steering {x} from agent {x} ({d} dBm) to router {x} ({d} dBm)", .{ c.wouldPrefix(), cl.mac, a.al_mac, here, target.bssid, h.rssi });
             if (c.cfg.steering == .log) return null;
             const req = cmdu.steeringRequest(cl.bssid, cl.mac, target);
             return try cmdu.build(out, a.al_mac, c.cfg.al_mac, .client_steering_request, c.mid(), &.{
@@ -591,7 +679,7 @@ pub const Controller = struct {
         const agent_bss = a.fronthaulBss(.@"5", want.ssid) orelse return null;
         for (c.local_clients[0..c.n_local]) |lc| {
             const local = c.cfg.local[lc.bss];
-            if (local.band != .@"5" or a.ownsIface(lc.mac)) continue;
+            if (local.band != .@"5" or !lc.btm or a.ownsIface(lc.mac)) continue;
             const since = lc.weak_since orelse continue;
             if (now - since < timing.weak_for or c.recentlySteered(lc.mac, now)) continue;
             c.noteSteer(lc.mac, now);
@@ -639,6 +727,7 @@ pub const Controller = struct {
             if (c.cfg.steering != .off) {
                 if (try c.steerFromAgent(a, now, out)) |frame| return .{ .frame = frame };
                 if (c.steerToAgent(a, now)) |btm| return .{ .btm = btm };
+                if (try c.queryBeacons(a, now, out)) |frame| return .{ .frame = frame };
             }
             if (a.n_clients > 0 and (if (a.last_metrics_query) |t| now - t > timing.metrics_interval else true)) {
                 a.last_metrics_query = now;
@@ -1071,7 +1160,7 @@ test "steering: both directions, same band only, held against ping-pong, reports
     try testing.expect((try cmdu.Frame.parse(logged.frame.?)).msg_type != .client_steering_request);
     try testing.expect(c.recentlySteered(phone, 3 * s));
     c.cfg.steering = .on;
-    c.steered = @splat(.{ .mac = @splat(0), .at = null });
+    c.steered = @splat(.{});
     c.onProbe(phone, 3 * s, .{ .bss = 0, .rssi = -62, .at = 3 * s });
     a.last_metrics_query = 3 * s;
 
@@ -1113,6 +1202,64 @@ test "steering: both directions, same band only, held against ping-pong, reports
     try testing.expectEqual(null, c.local_clients[0].weak_since);
 }
 
+test "steering by beacon report; refusals back off; no suggestion without 802.11v" {
+    const c6_5g: Mac = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x40 };
+    const local = [_]LocalBss{.{ .bssid = c6_5g, .band = .@"5", .op_class = 128, .channel = 149 }};
+    var c = testController(false);
+    c.cfg.steering = .on;
+    c.cfg.local = &local;
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    const s = std.time.ms_per_s;
+    _ = try c.onFrame(try topologyWithSsid(&in, "MK 5GHz Ext"), 0, &out, testSecrets());
+    _ = try c.onFrame(try m1Frame(&in), 0, &out, testSecrets());
+    const a = c.agent(ax12).?;
+    a.caps = @bitCast(@as(u8, 0x20));
+    const phone: Mac = .{ 0x02, 0, 0, 0, 0, 0xa1 };
+    const joined = phone ++ radio5 ++ [_]u8{0x80};
+    _ = try c.onFrame(try frameFrom(&in, .topology_notification, &.{.{ .type = .client_association_event, .value = &joined }}), s, &out, testSecrets());
+    const cl = a.client(phone).?;
+    cl.rssi = -72;
+    cl.metrics_at = s;
+    a.last_metrics_query = s;
+
+    // Weak on the agent and no router reading: ask the client, on the router's 20 MHz channel.
+    const q: cmdu.Frame = try .parse((try c.tick(2 * s, &out)).frame.?);
+    try testing.expectEqual(cmdu.MsgType.beacon_metrics_query, q.msg_type);
+    const qv = q.find(.beacon_metrics_query).?;
+    try testing.expectEqualSlices(u8, &phone, qv[0..6]);
+    try testing.expectEqual(125, qv[6]);
+    try testing.expectEqual(149, qv[7]);
+    try testing.expectEqual(null, (try c.tick(3 * s, &out)).frame); // not again within a minute
+
+    // The client hears the router at -55 and the agent at -71: ACK, then steer.
+    const rep = struct {
+        fn of(bssid: Mac, rcpi: u8) [31]u8 {
+            const z11: [11]u8 = @splat(0);
+            const z5: [5]u8 = @splat(0);
+            return [_]u8{ 39, 29, 1, 0, 5, 125, 149 } ++ z11 ++ [_]u8{ rcpi, 0 } ++ bssid ++ z5;
+        }
+    };
+    const resp = phone ++ [_]u8{ 0, 2 } ++ rep.of(c6_5g, 110) ++ rep.of(radio5, 78);
+    const ack: cmdu.Frame = try .parse((try c.onFrame(try frameFrom(&in, .beacon_metrics_response, &.{.{ .type = .beacon_metrics_response, .value = &resp }}), 4 * s, &out, testSecrets())).?);
+    try testing.expectEqual(cmdu.MsgType.ack, ack.msg_type);
+    try testing.expectEqual(@as(?i8, -71), cl.heard.?.serving);
+    try testing.expectEqual(cmdu.MsgType.client_steering_request, (try cmdu.Frame.parse((try c.tick(5 * s, &out)).frame.?)).msg_type);
+
+    // It refuses: the hold doubles to 10 minutes.
+    const refused = radio5 ++ phone ++ [_]u8{1};
+    _ = try c.onFrame(try frameFrom(&in, .client_steering_btm_report, &.{.{ .type = .steering_btm_report, .value = &refused }}), 6 * s, &out, testSecrets());
+    try testing.expect(c.recentlySteered(phone, 5 * s + 6 * std.time.ms_per_min));
+    try testing.expect(!c.recentlySteered(phone, 5 * s + 11 * std.time.ms_per_min));
+
+    // A router client without 802.11v is never sent a suggestion.
+    const old_laptop: Mac = .{ 0x02, 0, 0, 0, 0, 0xa3 };
+    c.setLocalClients(&.{.{ .mac = old_laptop, .bss = 0, .rssi = -85, .btm = false }}, 10 * s);
+    c.setLocalClients(&.{.{ .mac = old_laptop, .bss = 0, .rssi = -85, .btm = false }}, 40 * s);
+    a.last_heard = 40 * s;
+    try testing.expectEqual(null, c.steerToAgent(a, 40 * s));
+}
+
 test "state survives a save/load round trip" {
     var c = testController(false);
     var in: [cmdu.max_frame]u8 = undefined;
@@ -1140,7 +1287,7 @@ test "fuzz: random frames from a known agent never crash the controller" {
     var in: [cmdu.max_frame]u8 = undefined;
     var out: [cmdu.max_frame]u8 = undefined;
     var tlv_buf: [300]u8 = undefined;
-    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific, .topology_notification, .ap_capability_report, .assoc_sta_link_metrics_response, .client_steering_btm_report, .steering_completed };
+    const types = [_]cmdu.MsgType{ .ap_autoconfig_search, .topology_query, .topology_response, .ap_autoconfig_wsc, .vendor_specific, .topology_notification, .ap_capability_report, .assoc_sta_link_metrics_response, .client_steering_btm_report, .steering_completed, .beacon_metrics_response };
     for (0..5000) |i| {
         const n = rand.uintAtMost(usize, tlv_buf.len);
         rand.bytes(tlv_buf[0..n]);
