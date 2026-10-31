@@ -9,8 +9,8 @@ set -eu
 sdk=${1:?usage: make-r2.sh <sdk dir>}
 pkg=$sdk/package/meshkeeper
 sed -i 's/^PKG_RELEASE:=1$/PKG_RELEASE:=2/' "$pkg/Makefile"
-sed -i 's/(default: meshkeeper)/(default: meshkeeper, r2)/' "$pkg/src/main.zig"
-grep -q 'PKG_RELEASE:=2' "$pkg/Makefile" && grep -q 'meshkeeper, r2' "$pkg/src/main.zig"
+sed -i 's/(default: meshkeeper)/(default: meshkeeper, r2)/' "$pkg/src/daemon.zig"
+grep -q 'PKG_RELEASE:=2' "$pkg/Makefile" && grep -q 'meshkeeper, r2' "$pkg/src/daemon.zig"
 cd "$sdk"
 make package/meshkeeper/clean V=s
 make package/meshkeeper/compile V=s
