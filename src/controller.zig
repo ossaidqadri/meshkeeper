@@ -489,7 +489,7 @@ pub const Controller = struct {
             r.band = band;
             c.dirty = true;
         }
-        const want = c.cfg.fronthaul[@intFromEnum(band)] orelse return null;
+        const want = c.cfg.fronthaul[@backingInt(band)] orelse return null;
         if (!c.needsConfig(a, r, want)) return null;
         if (r.last_push) |t| if (now - t < timing.renew_spacing) {
             log.warn("agent {x} radio {x}: settings pushed {d} s ago, not again yet", .{ a.al_mac, r.ruid, @divTrunc(now - t, std.time.ms_per_s) });
@@ -689,7 +689,7 @@ pub const Controller = struct {
 
     /// A router client weak for a while on 5 GHz: suggest the agent's 5 GHz BSS.
     fn steerToAgent(c: *Controller, a: *const Agent, now: Ms) ?Btm {
-        const want = c.cfg.fronthaul[@intFromEnum(Band.@"5")] orelse return null;
+        const want = c.cfg.fronthaul[@backingInt(Band.@"5")] orelse return null;
         const agent_bss = a.fronthaulBss(.@"5", want.ssid) orelse return null;
         for (c.local_clients[0..c.n_local]) |lc| {
             const local = c.cfg.local[lc.bss];
@@ -761,7 +761,7 @@ pub const Controller = struct {
         if (a.last_renew) |t| if (now - t < timing.renew_spacing) return null;
         for (a.radios[0..a.n_radios]) |*r| {
             const band = r.band orelse continue;
-            const want = c.cfg.fronthaul[@intFromEnum(band)] orelse continue;
+            const want = c.cfg.fronthaul[@backingInt(band)] orelse continue;
             if (c.needsConfig(a, r, want)) return band;
         }
         return null;
@@ -1315,7 +1315,7 @@ test "fuzz: random frames from a known agent never crash the controller" {
     for (0..5000) |i| {
         const n = rand.uintAtMost(usize, tlv_buf.len);
         rand.bytes(tlv_buf[0..n]);
-        const t: cmdu.Tlv = @enumFromInt(rand.int(u8));
+        const t: cmdu.Tlv = @fromBackingInt(rand.int(u8));
         const f = frameFrom(&in, types[rand.uintLessThan(usize, types.len)], &.{.{ .type = t, .value = tlv_buf[0..n] }}) catch continue;
         _ = c.onFrame(f, @intCast(i), &out, testSecrets()) catch {};
         _ = c.tick(@intCast(i), &out) catch {};

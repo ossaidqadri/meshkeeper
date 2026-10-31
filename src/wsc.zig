@@ -98,7 +98,7 @@ pub const M1 = struct {
 
         var r: Io.Reader = .fixed(raw);
         while (r.bufferedLen() >= 4) {
-            const t: Attr = @enumFromInt(r.takeInt(u16, .big) catch unreachable);
+            const t: Attr = @fromBackingInt(r.takeInt(u16, .big) catch unreachable);
             const n = r.takeInt(u16, .big) catch unreachable;
             const v = r.take(n) catch return error.Truncated;
             switch (t) {
@@ -262,7 +262,7 @@ fn writeM2Body(w: *Io.Writer, m1: M1, bss: Bss, uuid: *const [16]u8, public_key:
 
     const ciphertext = p.buffered();
     cbcEncrypt(&keys.key_wrap_key, secrets.iv, ciphertext);
-    try w.writeInt(u16, @intFromEnum(Attr.encr_settings), .big);
+    try w.writeInt(u16, @backingInt(Attr.encr_settings), .big);
     try w.writeInt(u16, @intCast(16 + ciphertext.len), .big);
     try w.writeAll(&secrets.iv);
     try w.writeAll(ciphertext);
@@ -284,14 +284,14 @@ fn cbcEncrypt(key: *const [16]u8, iv: [16]u8, data: []u8) void {
 }
 
 fn putAttr(w: *Io.Writer, t: Attr, v: []const u8) Io.Writer.Error!void {
-    try w.writeInt(u16, @intFromEnum(t), .big);
+    try w.writeInt(u16, @backingInt(t), .big);
     try w.writeInt(u16, @intCast(v.len), .big);
     try w.writeAll(v);
 }
 
 fn putAttrInt(w: *Io.Writer, t: Attr, v: anytype) Io.Writer.Error!void {
     const T = @TypeOf(v);
-    try w.writeInt(u16, @intFromEnum(t), .big);
+    try w.writeInt(u16, @backingInt(t), .big);
     try w.writeInt(u16, @sizeOf(T), .big);
     try w.writeInt(T, v, .big);
 }

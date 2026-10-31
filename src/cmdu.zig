@@ -104,7 +104,7 @@ pub const Frame = struct {
         return .{
             .dst = frame[0..6].*,
             .src = frame[6..12].*,
-            .msg_type = @enumFromInt(mem.readInt(u16, h[2..4], .big)),
+            .msg_type = @fromBackingInt(mem.readInt(u16, h[2..4], .big)),
             .mid = mem.readInt(u16, h[4..6], .big),
             .fragment = h[6],
             .flags = h[7],
@@ -131,7 +131,7 @@ pub const TlvIterator = struct {
     /// Next TLV, null at End of Message or end of data (frames are padded to 60 bytes).
     pub fn next(it: *TlvIterator) ParseError!?TlvEntry {
         if (it.r.bufferedLen() < 3) return null;
-        const t: Tlv = @enumFromInt(it.r.takeByte() catch unreachable);
+        const t: Tlv = @fromBackingInt(it.r.takeByte() catch unreachable);
         const n = it.r.takeInt(u16, .big) catch unreachable;
         if (t == .end) return null;
         const v = it.r.take(n) catch return error.Truncated;
@@ -147,11 +147,11 @@ pub fn build(out: []u8, dst: Mac, src: Mac, msg_type: MsgType, mid: u16, entries
     try w.writeAll(&src);
     try w.writeInt(u16, ethertype, .big);
     try w.writeAll(&.{ 0, 0 });
-    try w.writeInt(u16, @intFromEnum(msg_type), .big);
+    try w.writeInt(u16, @backingInt(msg_type), .big);
     try w.writeInt(u16, mid, .big);
     try w.writeAll(&.{ 0, flag_last_fragment });
     for (entries) |e| {
-        try w.writeByte(@intFromEnum(e.type));
+        try w.writeByte(@backingInt(e.type));
         try w.writeInt(u16, @intCast(e.value.len), .big);
         try w.writeAll(e.value);
     }
