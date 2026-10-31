@@ -1,4 +1,8 @@
 FROM debian:bookworm
+# deb.debian.org is slow from some networks (79 KB/s against 2 MB/s for kernel.org's mirror here);
+# run.sh passes BENCH_DEBIAN_MIRROR, CI keeps the default.
+ARG DEBIAN_MIRROR=
+RUN [ -z "$DEBIAN_MIRROR" ] || sed -i "s|http://deb.debian.org/debian$|$DEBIAN_MIRROR|" /etc/apt/sources.list.d/debian.sources
 # qemu-system-mips 7.2 in bookworm: new enough for -netdev dgram.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends qemu-system-mips qemu-system-x86 ipxe-qemu seabios curl ca-certificates openssh-client xz-utils >/dev/null

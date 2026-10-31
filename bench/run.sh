@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 # rewrites anything that looks like a path (/apks/x.apk) when calling podman.exe; that's off here.
 repo=$(cd .. && { pwd -W 2>/dev/null || pwd; })
 export MSYS_NO_PATHCONV=1
-podman build -q -t meshkeeper-bench -f Containerfile .
+podman build -q -t meshkeeper-bench --build-arg DEBIAN_MIRROR="${BENCH_DEBIAN_MIRROR-http://mirrors.edge.kernel.org/debian}" -f Containerfile .
 # APK_DIR shows up as /apks, e.g. --meshkeeper-apk /apks/meshkeeper-0.2.0-r1.apk. The default is
 # where `build-apks.sh ath79/generic` puts the C6's apks.
 mkdir -p "${APK_DIR:=$repo/bench/.run/apks/ath79-generic/out}"
