@@ -1,0 +1,37 @@
+# OpenWrt 25.12.6 x86-64 (squashfs-combined, BIOS boot) in QEMU, for the sysupgrade test only:
+# malta has no sysupgrade image. TCG (no KVM) so it works anywhere; one NIC, user networking,
+# ssh forwarded to 127.0.0.1:$BENCH_SSH_PORT (default 2222) by the strategy.
+targets:
+  main:
+    resources:
+      - NetworkService:
+          address: 127.0.0.1
+          port: 22
+          username: root
+    drivers:
+      - QEMUDriver:
+          qemu_bin: qemu_bin
+          machine: pc
+          cpu: qemu64
+          memory: 512M
+          disk: disk
+          nic: user,model=virtio-net-pci,mac=52:54:00:12:34:01,net=192.168.1.0/24,id=lan
+      - ShellDriver:
+          login_prompt: Please press Enter to activate this console.
+          prompt: 'root@[\w()-]+:[^ ]+ '
+          await_login_timeout: 120
+          username: root
+      - SSHDriver:
+          keyfile: /tmp/bench-run/id_ed25519
+          connection_timeout: 120.0
+          explicit_scp_mode: true
+      - OpenWrtStrategy:
+          # Copied to the disk below before every boot, so the cached image stays pristine.
+          disk_template: .cache/openwrt-25.12.6-x86-64-generic-squashfs-combined.img
+          satellite_nic: false  # one NIC only
+tools:
+  qemu_bin: qemu-system-x86_64
+images:
+  disk: /tmp/bench-run/disk.img
+imports:
+  - ../strategies/openwrt.py

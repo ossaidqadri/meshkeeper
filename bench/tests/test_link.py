@@ -14,7 +14,8 @@ def test_internet(ssh):
 
 
 def test_eth1_in_bridge(ssh):
-    assert sh(ssh, "basename $(readlink /sys/class/net/eth1/master)") == "br-lan"
+    state = sh(ssh, "ls /sys/class/net; uci show network | grep -E 'device|ports|gateway'; ls -l /sys/class/net/eth1/ | head -5", check=False)
+    assert sh(ssh, "basename $(readlink /sys/class/net/eth1/master)", check=False) == "br-lan", state
 
 
 def test_frame_from_agent_socket_reaches_br_lan(ssh):

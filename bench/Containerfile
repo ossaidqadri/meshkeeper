@@ -1,7 +1,7 @@
 FROM debian:bookworm
 # qemu-system-mips 7.2 in bookworm: new enough for -netdev dgram.
 RUN apt-get update -qq \
- && apt-get install -y -qq --no-install-recommends qemu-system-mips ipxe-qemu seabios curl ca-certificates openssh-client xz-utils >/dev/null
+ && apt-get install -y -qq --no-install-recommends qemu-system-mips qemu-system-x86 ipxe-qemu seabios curl ca-certificates openssh-client xz-utils >/dev/null
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
 # Zig builds the fake satellite from the repo's own sources. Same version and hash as the Makefile.
 ARG ZIG_VERSION=0.17.0

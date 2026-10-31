@@ -58,6 +58,27 @@ uci commit meshkeeper
 """
 
 
+def setup_wireless(run):
+    """Simulated radios (mac80211_hwsim, 3 of them) and the README-style wireless config, hostapd up.
+
+    `run(cmd, check=True)` runs a command on the router and returns its stdout."""
+    run("apk update")
+    run("apk del wpad-basic-mbedtls; apk add wpad-mbedtls kmod-mac80211-hwsim")
+    run("apk info -e wpad-mbedtls && /etc/init.d/wpad restart")  # the running one is still wpad-basic
+    # The x86 image ships no wifi handler scripts, so netifd has no network.wireless object (malta does).
+    run("apk add wifi-scripts iw")
+    run("ubus list network.wireless >/dev/null 2>&1 || (/etc/init.d/network restart >/dev/null 2>&1 &)")
+    run("sleep 10; ubus list network.wireless")
+    run("rmmod mac80211_hwsim 2>/dev/null; modprobe mac80211_hwsim radios=3")
+    run("sleep 3; iw dev >/dev/null; ls /sys/class/ieee80211")
+    for line in WIRELESS.strip().split("\n"):  # one call per line keeps a failure attributable
+        run(line)
+    for _ in range(30):
+        if run("ubus list 'hostapd.*' | wc -l", check=False) not in ("", "0"):
+            break
+        run("sleep 1")
+
+
 @pytest.fixture(scope="session")
 def meshkeeper(router, ssh, request):
     """The router with simulated radios, a README-style wireless config and meshkeeper installed."""
@@ -65,17 +86,7 @@ def meshkeeper(router, ssh, request):
     luci = request.config.getoption("--luci-apk")
     if not apk or not luci:
         pytest.skip("--meshkeeper-apk and --luci-apk are required")
-    sh(ssh, "apk update")
-    sh(ssh, "apk del wpad-basic-mbedtls; apk add wpad-mbedtls kmod-mac80211-hwsim")
-    sh(ssh, "apk info -e wpad-mbedtls && /etc/init.d/wpad restart")  # the running one is still wpad-basic
-    sh(ssh, "rmmod mac80211_hwsim 2>/dev/null; modprobe mac80211_hwsim radios=3")
-    sh(ssh, "sleep 3; iw dev >/dev/null; ls /sys/class/ieee80211")
-    for line in WIRELESS.strip().split("\n"):  # one call per line keeps a failure attributable
-        sh(ssh, line)
-    for _ in range(30):
-        if sh(ssh, "ubus list 'hostapd.*' | wc -l", check=False) not in ("", "0"):
-            break
-        sh(ssh, "sleep 1")
+    setup_wireless(lambda cmd, check=True: sh(ssh, cmd, check))
     ssh.put(apk, "/tmp/meshkeeper.apk")
     ssh.put(luci, "/tmp/luci-app-meshkeeper.apk")
     # --force-non-repository: the initramfs root is RAM, apk warns the package is lost on reboot.
