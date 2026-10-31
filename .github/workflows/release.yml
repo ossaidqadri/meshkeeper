@@ -22,36 +22,22 @@ jobs:
       - run: zig fmt --check src build.zig
       - run: zig build test
 
-  # Every arch on a tag; the real router plus the smoke-test arch on a PR.
-  targets:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.pick.outputs.matrix }}
-    steps:
-      - id: pick
-        env:
-          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        run: |
-          all='[{"name":"mips_24kc","target":"ath79/generic"},
-                {"name":"mipsel_24kc","target":"ramips/mt7621"},
-                {"name":"arm_cortex-a7_neon-vfpv4","target":"ipq40xx/generic"},
-                {"name":"aarch64_cortex-a53","target":"mediatek/filogic"},
-                {"name":"x86_64","target":"x86/64"}]'
-          some='[{"name":"mips_24kc","target":"ath79/generic"},
-                 {"name":"x86_64","target":"x86/64"}]'
-          if [ "$IS_TAG" = "true" ]; then
-            echo "matrix=$all" >> "$GITHUB_OUTPUT"
-          else
-            echo "matrix=$some" >> "$GITHUB_OUTPUT"
-          fi
-
   package:
-    needs: [test, targets]
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Every arch on a tag; the real router plus the smoke-test arch otherwise.
       matrix:
-        include: ${{ fromJSON(needs.targets.outputs.matrix) }}
+        include: >-
+          ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[
+            {"name":"mips_24kc","target":"ath79/generic"},
+            {"name":"mipsel_24kc","target":"ramips/mt7621"},
+            {"name":"arm_cortex-a7_neon-vfpv4","target":"ipq40xx/generic"},
+            {"name":"aarch64_cortex-a53","target":"mediatek/filogic"},
+            {"name":"x86_64","target":"x86/64"}]' || '[
+            {"name":"mips_24kc","target":"ath79/generic"},
+            {"name":"x86_64","target":"x86/64"}]') }}
     steps:
       - uses: actions/checkout@v4
 
