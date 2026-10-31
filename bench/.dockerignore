@@ -1,2 +1,4 @@
-# The Containerfile copies nothing; keep the cached images out of the build context.
+# Only the dependency lists go into the build; keeps the cached images out of the context.
 *
+!pyproject.toml
+!uv.lock

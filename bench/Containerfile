@@ -12,5 +12,8 @@ RUN curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/${ZIG_VERSION}/zi
  && ln -s /opt/zig/zig /usr/local/bin/zig
 # The project lives on a host mount; keep the venv and caches off it.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy UV_CACHE_DIR=/opt/uv-cache UV_PYTHON_INSTALL_DIR=/opt/uv-python ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache
+# Python and the test dependencies, installed once here; `uv sync --frozen` at run time is then a no-op.
+COPY pyproject.toml uv.lock /opt/bench/
+RUN cd /opt/bench && uv sync --frozen --no-install-project
 # The repo is mounted at /repo: the fake satellite imports ../src/cmdu.zig and wsc.zig.
 WORKDIR /repo/bench
