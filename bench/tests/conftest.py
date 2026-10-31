@@ -1,3 +1,5 @@
+import os
+import subprocess
 import time
 
 import pytest
@@ -82,6 +84,19 @@ def meshkeeper(router, ssh, request):
         sh(ssh, line)
     sh(ssh, "/etc/init.d/meshkeeper restart; sleep 8")
     return ssh
+
+
+@pytest.fixture(scope="session")
+def fake_agent():
+    """Builds bench/fake-agent from the repo's own cmdu.zig and wsc.zig; returns the binary path."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "..", "fake-agent")
+    subprocess.run(
+        ["zig", "build", "-Dtarget=x86_64-linux-musl", "-Doptimize=ReleaseSafe",
+         "--prefix", "/tmp/fake-agent", "--cache-dir", "/tmp/fake-agent-cache"],
+        cwd=src, check=True,
+    )
+    return "/tmp/fake-agent/bin/fake-agent"
 
 
 def sh(driver, cmd, check=True):
