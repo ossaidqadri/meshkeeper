@@ -18,6 +18,7 @@ jobs:
           echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig-x86_64-linux-0.17.0.tar.xz" | sha256sum -c -
           tar -xf zig-x86_64-linux-0.17.0.tar.xz
           echo "${{ github.workspace }}/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+      - run: zig fmt --check src build.zig
       - run: zig build test
 
   # Every arch on a tag; the real router plus the smoke-test arch on a PR.
