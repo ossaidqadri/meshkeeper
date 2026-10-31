@@ -23,7 +23,7 @@ const dh_prime: [dh_len]u8 = hexArray(
         "9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
 );
 
-const Attr = enum(u16) {
+pub const Attr = enum(u16) {
     version = 0x104A,
     msg_type = 0x1022,
     uuid_e = 0x1047,
@@ -58,8 +58,8 @@ const Attr = enum(u16) {
     _,
 };
 
-const msg_m1 = 0x04;
-const msg_m2 = 0x05;
+pub const msg_m1 = 0x04;
+pub const msg_m2 = 0x05;
 
 pub const auth_wpa2psk = 0x0020;
 pub const auth_sae = 0x0040;
@@ -194,19 +194,30 @@ pub const Secrets = struct {
 
 pub const BuildError = error{ InvalidPeerKey, BufferTooSmall } || crypto.ff.NullExponentError;
 
-/// Builds M2 for `m1` into `out` and returns the used slice.
-pub fn buildM2(out: []u8, m1: M1, bss: Bss, registrar_uuid: *const [16]u8, secrets: Secrets) BuildError![]u8 {
+/// g^private mod p: the public key sent in M1 or M2.
+pub fn dhPublic(private: *const [dh_len]u8) crypto.ff.NullExponentError![dh_len]u8 {
     const dh = Dh.fromBytes(&dh_prime, .big) catch unreachable;
     const generator = Dh.Fe.fromPrimitive(u8, dh, 2) catch unreachable;
-    const peer = Dh.Fe.fromBytes(dh, m1.public_key, .big) catch return error.InvalidPeerKey;
-    // Reject 0, 1 and p-1, which would force a trivial shared secret.
+    var out: [dh_len]u8 = undefined;
+    (try dh.powWithEncodedExponent(generator, private, .big)).toBytes(&out, .big) catch unreachable;
+    return out;
+}
+
+/// peer^private mod p. Rejects 0, 1 and p-1, which would force a trivial shared secret.
+pub fn dhShared(private: *const [dh_len]u8, peer_key: *const [dh_len]u8) (error{InvalidPeerKey} || crypto.ff.NullExponentError)![dh_len]u8 {
+    const dh = Dh.fromBytes(&dh_prime, .big) catch unreachable;
+    const peer = Dh.Fe.fromBytes(dh, peer_key, .big) catch return error.InvalidPeerKey;
     const p_minus_1 = dh.sub(dh.zero, dh.one());
     if (peer.isZero() or peer.eql(dh.one()) or peer.eql(p_minus_1)) return error.InvalidPeerKey;
+    var out: [dh_len]u8 = undefined;
+    (try dh.powWithEncodedExponent(peer, private, .big)).toBytes(&out, .big) catch unreachable;
+    return out;
+}
 
-    var public_key: [dh_len]u8 = undefined;
-    var shared: [dh_len]u8 = undefined;
-    (try dh.powWithEncodedExponent(generator, &secrets.dh_private, .big)).toBytes(&public_key, .big) catch unreachable;
-    (try dh.powWithEncodedExponent(peer, &secrets.dh_private, .big)).toBytes(&shared, .big) catch unreachable;
+/// Builds M2 for `m1` into `out` and returns the used slice.
+pub fn buildM2(out: []u8, m1: M1, bss: Bss, registrar_uuid: *const [16]u8, secrets: Secrets) BuildError![]u8 {
+    const shared = try dhShared(&secrets.dh_private, m1.public_key);
+    const public_key = try dhPublic(&secrets.dh_private);
     const keys = Keys.derive(&shared, m1.nonce, m1.mac, &secrets.registrar_nonce);
 
     var w: Io.Writer = .fixed(out);
@@ -283,13 +294,13 @@ fn cbcEncrypt(key: *const [16]u8, iv: [16]u8, data: []u8) void {
     }
 }
 
-fn putAttr(w: *Io.Writer, t: Attr, v: []const u8) Io.Writer.Error!void {
+pub fn putAttr(w: *Io.Writer, t: Attr, v: []const u8) Io.Writer.Error!void {
     try w.writeInt(u16, @backingInt(t), .big);
     try w.writeInt(u16, @intCast(v.len), .big);
     try w.writeAll(v);
 }
 
-fn putAttrInt(w: *Io.Writer, t: Attr, v: anytype) Io.Writer.Error!void {
+pub fn putAttrInt(w: *Io.Writer, t: Attr, v: anytype) Io.Writer.Error!void {
     const T = @TypeOf(v);
     try w.writeInt(u16, @backingInt(t), .big);
     try w.writeInt(u16, @sizeOf(T), .big);
