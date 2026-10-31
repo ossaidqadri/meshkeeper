@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const cmdu = @import("cmdu.zig");
 const wsc = @import("wsc.zig");
 const uci = @import("uci.zig");
+const ubus = @import("ubus.zig");
 const controller = @import("controller.zig");
 const Controller = controller.Controller;
 
@@ -114,9 +115,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Settings live in their own arena, replaced whole on every reload, so a
     // long-running daemon doesn't grow with each Wi-Fi reload or retry.
+    var bus: ubus.Conn = .{};
+    defer bus.deinit(init.gpa);
     var settings_arena: std.heap.ArenaAllocator = .init(init.gpa);
     defer settings_arena.deinit();
-    var settings = try loadSettings(settings_arena.allocator(), init.gpa, io, config_name);
+    var settings = try loadSettings(settings_arena.allocator(), init.gpa, io, &bus, config_name);
     const sock = try PacketSocket.open(io, settings.interface);
     defer sock.close();
 
@@ -137,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var probes: ProbeFeed = .{};
-    defer probes.stop(io);
+    defer probes.sub.deinit(init.gpa);
     var resubscribe_at: i64 = 0;
     var mesh_at: i64 = 0;
     var local_at: i64 = 0;
@@ -148,21 +151,21 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         const now = Io.Clock.awake.now(io).toMilliseconds();
 
-        if (probes.child == null and now >= resubscribe_at) {
+        if (!probes.sub.active() and now >= resubscribe_at) {
             var fresh: std.heap.ArenaAllocator = .init(init.gpa);
-            if (loadSettings(fresh.allocator(), init.gpa, io, config_name)) |s| {
+            if (loadSettings(fresh.allocator(), init.gpa, io, &bus, config_name)) |s| {
                 settings_arena.deinit();
                 settings_arena = fresh;
                 settings = s;
                 ctl.cfg.fronthaul = settings.fronthaul;
                 ctl.cfg.steering = settings.steering;
                 ctl.setLocal(settings.local);
-                if (settings.steering == .on and !observe) enableBtm(init.gpa, io, settings);
+                if (settings.steering == .on and !observe) enableBtm(init.gpa, &bus, settings);
             } else |err| {
                 fresh.deinit();
                 log.warn("reloading settings failed ({t}), keeping the old ones", .{err});
             }
-            probes.start(init.gpa, io, settings.hostapd_objects) catch |err| {
+            probes.start(init.gpa, &bus, settings.hostapd_objects) catch |err| {
                 log.warn("hostapd subscription failed ({t})", .{err});
                 resubscribe_at = now + resubscribe_after_ms;
             };
@@ -170,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
 
         var fds = [_]posix.pollfd{
             .{ .fd = sock.fd, .events = posix.POLL.IN, .revents = 0 },
-            .{ .fd = if (probes.child) |c| c.stdout.?.handle else -1, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = probes.sub.fd(), .events = posix.POLL.IN, .revents = 0 },
         };
         _ = try posix.poll(&fds, 1000);
 
@@ -187,8 +190,8 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (fds[1].revents != 0) {
-            if (!probes.drain(&ctl, settings, now)) {
-                probes.stop(io);
+            if (!probes.drain(init.gpa, &ctl, settings, now)) {
+                probes.sub.stop();
                 resubscribe_at = now + resubscribe_after_ms;
                 log.info("hostapd subscription ended (Wi-Fi reload?), resubscribing", .{});
             }
@@ -199,12 +202,12 @@ pub fn main(init: std.process.Init) !void {
             break :blk Controller.Tick{};
         };
         if (t.frame) |frame| send(sock, observe, frame);
-        if (t.wps) |w| openWps(init.gpa, io, settings, w);
-        if (t.btm) |b| suggestMove(init.gpa, io, settings, observe, b);
+        if (t.wps) |w| openWps(init.gpa, &bus, settings, w);
+        if (t.btm) |b| suggestMove(init.gpa, &bus, settings, observe, b);
 
         if (settings.steering != .off and now >= local_at) {
             local_at = now + local_every_ms;
-            pollLocalClients(init.gpa, io, settings, &ctl, now);
+            pollLocalClients(init.gpa, &bus, settings, &ctl, now);
         }
 
         if (ctl.dirty) {
@@ -318,43 +321,23 @@ const PacketSocket = struct {
     }
 };
 
-/// `ubus subscribe` on the hostapd objects, read line by line for probe requests.
+/// hostapd notifications (probe requests, 802.11v answers) from a ubus subscription.
 const ProbeFeed = struct {
-    child: ?std.process.Child = null,
+    sub: ubus.Subscriber = .{},
     line: [8192]u8 = undefined,
-    len: usize = 0,
 
-    fn start(feed: *ProbeFeed, gpa: Allocator, io: Io, objects: []const []const u8) !void {
+    fn start(feed: *ProbeFeed, gpa: Allocator, bus: *ubus.Conn, objects: []const []const u8) !void {
         // hostapd only reports probes to subscribers once notify_response is set.
-        for (objects) |obj| _ = ubus(gpa, io, &.{ "call", obj, "notify_response", "{\"notify_response\":0}" }) catch {};
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ "ubus", "-S", "subscribe" });
-        try argv.appendSlice(gpa, objects);
-        feed.child = try std.process.spawn(io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore });
-        feed.len = 0;
+        for (objects) |obj| if (bus.call(gpa, obj, "notify_response", .{ .notify_response = 0 })) |r| gpa.free(r) else |_| {};
+        try feed.sub.start(gpa, objects);
         log.info("watching probe requests on {d} hostapd interface(s)", .{objects.len});
     }
 
-    fn stop(feed: *ProbeFeed, io: Io) void {
-        if (feed.child) |*c| {
-            c.kill(io);
-            feed.child = null;
-        }
-    }
-
-    /// One read per poll wakeup (poll said it is readable, so it can't block).
-    /// False once the subscription ended.
-    fn drain(feed: *ProbeFeed, ctl: *Controller, settings: Settings, now: i64) bool {
-        if (feed.len == feed.line.len) feed.len = 0; // oversized line: drop it
-        const n = posix.read(feed.child.?.stdout.?.handle, feed.line[feed.len..]) catch return false;
-        if (n == 0) return false;
-        feed.len += n;
-        while (std.mem.indexOfScalar(u8, feed.line[0..feed.len], '\n')) |nl| {
-            handleEvent(feed.line[0..nl], ctl, settings, now);
-            std.mem.copyForwards(u8, feed.line[0..], feed.line[nl + 1 .. feed.len]);
-            feed.len -= nl + 1;
-        }
+    /// One message per poll wakeup. False once the subscription ended.
+    fn drain(feed: *ProbeFeed, gpa: Allocator, ctl: *Controller, settings: Settings, now: i64) bool {
+        var w: Io.Writer = .fixed(&feed.line);
+        const event = feed.sub.next(gpa, &w) catch |err| return err == error.WriteFailed; // oversized event: drop it
+        if (event) handleEvent(w.buffered(), ctl, settings, now);
         return true;
     }
 
@@ -386,9 +369,9 @@ fn parseMacText(text: []const u8) ?cmdu.Mac {
 
 /// Lets clients see the router supports 802.11v (runtime only; a Wi-Fi reload
 /// undoes it and the next settings reload redoes it).
-fn enableBtm(gpa: Allocator, io: Io, s: Settings) void {
+fn enableBtm(gpa: Allocator, bus: *ubus.Conn, s: Settings) void {
     for (s.local_objects) |obj| {
-        const r = ubus(gpa, io, &.{ "call", obj, "bss_mgmt_enable", "{\"bss_transition\":true}" }) catch |err| {
+        const r = bus.call(gpa, obj, "bss_mgmt_enable", .{ .bss_transition = true }) catch |err| {
             log.warn("bss_mgmt_enable on {s} failed: {t}", .{ obj, err });
             continue;
         };
@@ -396,7 +379,7 @@ fn enableBtm(gpa: Allocator, io: Io, s: Settings) void {
     }
 }
 
-fn suggestMove(gpa: Allocator, io: Io, s: Settings, observe: bool, b: controller.Btm) void {
+fn suggestMove(gpa: Allocator, bus: *ubus.Conn, s: Settings, observe: bool, b: controller.Btm) void {
     const obj = s.local_objects[b.bss];
     // Neighbor Report body: BSSID, BSSID info (reachable, secure, same keys), op class, channel, PHY type VHT.
     var nr: [13]u8 = undefined;
@@ -405,24 +388,25 @@ fn suggestMove(gpa: Allocator, io: Io, s: Settings, observe: bool, b: controller
     nr[10] = b.target.op_class;
     nr[11] = b.target.channel;
     nr[12] = 9;
-    var arg_buf: [256]u8 = undefined;
-    const arg = std.fmt.bufPrint(&arg_buf, "{{\"addr\":\"{s}\",\"disassociation_imminent\":false,\"abridged\":true,\"validity_period\":30,\"neighbors\":[\"{s}\"]}}", .{ &controller.macText(b.sta), &std.fmt.bytesToHex(nr, .lower) }) catch unreachable;
+    const sta = controller.macText(b.sta);
+    const neighbor = std.fmt.bytesToHex(nr, .lower);
     if (observe) {
-        log.info("observe: would call {s} bss_transition_request {s}", .{ obj, arg });
+        log.info("observe: would call {s} bss_transition_request for {s}, neighbor {s}", .{ obj, &sta, &neighbor });
         return;
     }
-    const r = ubus(gpa, io, &.{ "call", obj, "bss_transition_request", arg }) catch |err| {
+    const arg = .{ .addr = &sta, .disassociation_imminent = false, .abridged = true, .validity_period = 30, .neighbors = .{&neighbor} };
+    const r = bus.call(gpa, obj, "bss_transition_request", arg) catch |err| {
         log.warn("bss_transition_request to {x} on {s} failed: {t}", .{ b.sta, obj, err });
         return;
     };
     gpa.free(r);
 }
 
-fn pollLocalClients(gpa: Allocator, io: Io, s: Settings, ctl: *Controller, now: i64) void {
+fn pollLocalClients(gpa: Allocator, bus: *ubus.Conn, s: Settings, ctl: *Controller, now: i64) void {
     var list: [controller.max_clients]controller.LocalClient = undefined;
     var n: usize = 0;
     for (s.local_objects, 0..) |obj, bss| {
-        const raw = ubus(gpa, io, &.{ "call", obj, "get_clients" }) catch continue;
+        const raw = bus.call(gpa, obj, "get_clients", .{}) catch continue;
         defer gpa.free(raw);
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
@@ -485,41 +469,27 @@ test "hostapd output as captured on the C6" {
     try std.testing.expectEqual(1, answer.@"bss-transition-response".?.@"status-code");
 }
 
-fn openWps(gpa: Allocator, io: Io, s: Settings, w: controller.WpsAction) void {
-    var arg_buf: [128]u8 = undefined;
-    const del = std.fmt.bufPrint(&arg_buf, "{{\"addr\":\"{s}\",\"reason\":3,\"deauth\":true,\"ban_time\":0}}", .{&controller.macText(w.stale_station)}) catch unreachable;
-    for (s.hostapd_objects) |obj| _ = ubus(gpa, io, &.{ "call", obj, "del_client", del }) catch {};
+fn openWps(gpa: Allocator, bus: *ubus.Conn, s: Settings, w: controller.WpsAction) void {
+    const sta = controller.macText(w.stale_station);
+    const del = .{ .addr = &sta, .reason = 3, .deauth = true, .ban_time = 0 };
+    for (s.hostapd_objects) |obj| if (bus.call(gpa, obj, "del_client", del)) |r| gpa.free(r) else |_| {};
     const obj = s.wps_object orelse {
         log.warn("no WPS-enabled fronthaul found, cannot open a window", .{});
         return;
     };
-    if (ubus(gpa, io, &.{ "call", obj, "wps_start" })) |_| {
+    if (bus.call(gpa, obj, "wps_start", .{})) |r| {
+        gpa.free(r);
         log.warn("opened WPS on {s} (window {d}); press WPS on the satellite", .{ obj, w.window });
     } else |err| log.warn("wps_start on {s} failed: {t}", .{ obj, err });
 }
 
-/// Runs `ubus` and returns its stdout (caller frees with `gpa`).
-fn ubus(gpa: Allocator, io: Io, args: []const []const u8) ![]u8 {
-    var argv_buf: [8][]const u8 = undefined;
-    argv_buf[0] = "ubus";
-    @memcpy(argv_buf[1..][0..args.len], args);
-    const r = try std.process.run(gpa, io, .{ .argv = argv_buf[0 .. args.len + 1], .stdout_limit = .limited(1 << 20) });
-    defer gpa.free(r.stderr);
-    errdefer gpa.free(r.stdout);
-    switch (r.term) {
-        .exited => |code| if (code != 0) return error.UbusFailed,
-        else => return error.UbusFailed,
-    }
-    return r.stdout;
-}
-
-fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u8) !Settings {
+fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, config_name: []const u8) !Settings {
     const own = try readUci(arena, io, config_name);
     const main_section = own.section("main") orelse return error.MissingMainSection;
     const wifi = try readUci(arena, io, "wireless");
     const opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
 
-    const status_raw = try ubus(gpa, io, &.{ "call", "network.wireless", "status" });
+    const status_raw = try bus.call(gpa, "network.wireless", "status", .{});
     defer gpa.free(status_raw);
     const Status = std.json.ArrayHashMap(struct { interfaces: []const struct { section: []const u8, ifname: ?[]const u8 = null } = &.{} });
     const status = try std.json.parseFromSliceLeaky(Status, arena, status_raw, opts);
@@ -546,7 +516,7 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
         fronthaul[band] = .{ .ssid = full_ssid, .passphrase = passphrase };
         const obj = try hostapdObject(arena, status, section) orelse continue;
         if (band == 1) wps_object = obj;
-        if (localBss(arena, gpa, io, obj)) |bss| {
+        if (localBss(arena, gpa, bus, obj)) |bss| {
             try local.append(arena, bss);
             try local_objects.append(arena, obj);
         } else |err| log.warn("{s} get_status: {t}", .{ obj, err });
@@ -575,8 +545,8 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, config_name: []const u
     };
 }
 
-fn localBss(arena: Allocator, gpa: Allocator, io: Io, obj: []const u8) !controller.LocalBss {
-    const raw = try ubus(gpa, io, &.{ "call", obj, "get_status" });
+fn localBss(arena: Allocator, gpa: Allocator, bus: *ubus.Conn, obj: []const u8) !controller.LocalBss {
+    const raw = try bus.call(gpa, obj, "get_status", .{});
     defer gpa.free(raw);
     const Status = struct { bssid: []const u8, freq: u32, channel: u8, op_class: u8 };
     const st = try std.json.parseFromSliceLeaky(Status, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
@@ -640,4 +610,5 @@ test {
     _ = @import("wsc.zig");
     _ = @import("controller.zig");
     _ = @import("uci.zig");
+    _ = @import("ubus.zig");
 }

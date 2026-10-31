@@ -24,11 +24,13 @@ start_service() {
 	# Boot can race br-lan/rpcd; keep retrying instead of giving up.
 	procd_set_param respawn 3600 5 0
 	procd_set_param stderr 1
-	procd_add_jail meshkeeper ubus sysfs log
+	# requirejail: never fall back to running unjailed. ronly: the only
+	# writable paths are the two mounted read-write below.
+	procd_add_jail meshkeeper ubus sysfs log ronly requirejail
 	# The directory, not single files: uci commit replaces files, and a
 	# file mount would keep showing the old one. Root-only configs stay
 	# unreadable to the service user.
-	procd_add_jail_mount /bin/ubus /etc/config
+	procd_add_jail_mount /etc/config
 	procd_add_jail_mount_rw "$STATE_DIR" "$MESH_DIR"
 	procd_set_param capabilities /etc/capabilities/meshkeeper.json
 	procd_set_param user meshkeeper
