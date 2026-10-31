@@ -679,9 +679,7 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, confi
             if (std.mem.eql(u8, u.section, section)) break u.object;
         } else continue;
         if (band == 1) wps_object = obj;
-        if (localBss(gpa, bus, obj)) |found| {
-            var bss = found;
-            bss.ssid = ssid; // no longer than full_ssid, so at most 32
+        if (localBss(gpa, bus, obj)) |bss| {
             try local.append(arena, bss);
             try local_objects.append(arena, obj);
         } else |err| log.warn("{s} get_status: {t}", .{ obj, err });

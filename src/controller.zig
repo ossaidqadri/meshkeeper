@@ -36,8 +36,6 @@ pub const max_ifaces = 8;
 pub const max_radios = 4;
 pub const max_ssids = 4;
 pub const max_clients = 32;
-/// Router BSSes the controller uses (one fronthaul per band).
-pub const max_local = 2;
 
 /// Milliseconds on a monotonic clock.
 pub const Ms = i64;
@@ -80,8 +78,6 @@ pub const LocalBss = struct {
     band: Band,
     op_class: u8,
     channel: u8,
-    /// At most 32 bytes.
-    ssid: []const u8 = "",
 
     pub fn target(l: LocalBss) cmdu.SteerTarget {
         return .{ .bssid = l.bssid, .op_class = l.op_class, .channel = l.channel };
@@ -392,18 +388,12 @@ pub const Controller = struct {
                 });
             },
             .topology_query => {
-                // The router is an agent too: its own BSSes are steering
-                // targets, and an agent may refuse a target it was never told of.
                 const info = cmdu.deviceInfo(c.cfg.al_mac);
-                const has_bss = c.cfg.local.len > 0;
-                var ops_buf: [1 + 2 * 7 + max_local * 39]u8 = undefined;
-                const tlvs = [_]cmdu.TlvEntry{
+                return try cmdu.build(out, f.src, c.cfg.al_mac, .topology_response, f.mid, &.{
                     .{ .type = .device_info, .value = &info },
-                    .{ .type = .supported_service, .value = if (has_bss) &.{ 2, cmdu.service_controller, cmdu.service_agent } else &.{ 1, cmdu.service_controller } },
+                    .{ .type = .supported_service, .value = &.{ 1, cmdu.service_controller } },
                     .{ .type = .multi_ap_profile, .value = &.{cmdu.profile} },
-                    .{ .type = .ap_operational_bss, .value = try ownBsses(c.cfg.local, &ops_buf) },
-                };
-                return try cmdu.build(out, f.src, c.cfg.al_mac, .topology_response, f.mid, if (has_bss) &tlvs else tlvs[0..3]);
+                });
             },
             .topology_response => {
                 try c.learnTopology(a, f, now);
@@ -943,30 +933,6 @@ fn testSecrets() wsc.Secrets {
     return s;
 }
 
-/// AP Operational BSS TLV value for the router's own BSSes, one radio per band.
-/// The band's first BSSID stands in for the radio UID, which only has to be
-/// unique within the device.
-fn ownBsses(local: []const LocalBss, buf: []u8) ![]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    var radios: u8 = 0;
-    try w.writeByte(0);
-    for ([_]Band{ .@"2.4", .@"5" }) |band| {
-        var n: u8 = 0;
-        for (local) |l| n += @intFromBool(l.band == band);
-        if (n == 0) continue;
-        radios += 1;
-        try w.writeAll(&(for (local) |l| (if (l.band == band) break l.bssid) else unreachable));
-        try w.writeByte(n);
-        for (local) |l| if (l.band == band) {
-            try w.writeAll(&l.bssid);
-            try w.writeByte(@intCast(l.ssid.len));
-            try w.writeAll(l.ssid);
-        };
-    }
-    buf[0] = radios;
-    return w.buffered();
-}
-
 fn frameFrom(buf: []u8, msg: cmdu.MsgType, tlvs: []const cmdu.TlvEntry) !cmdu.Frame {
     return .parse(try cmdu.build(buf, c6, ax12, msg, 7, tlvs));
 }
@@ -1021,33 +987,6 @@ test "answers search and topology query as controller" {
     try testing.expectEqual(cmdu.MsgType.topology_response, tr.msg_type);
     try testing.expectEqualSlices(u8, &.{ 1, cmdu.service_controller }, tr.find(.supported_service).?);
     try testing.expect(tr.find(.ap_operational_bss) == null);
-}
-
-test "topology response lists the router's own BSSes, one radio per band" {
-    var c = testController(false);
-    const c6_5g: Mac = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x40 };
-    const c6_24: Mac = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x24 };
-    const local = [_]LocalBss{
-        .{ .bssid = c6_5g, .band = .@"5", .op_class = 128, .channel = 149, .ssid = "MK 5" },
-        .{ .bssid = c6_24, .band = .@"2.4", .op_class = 81, .channel = 1, .ssid = "MK" },
-    };
-    c.cfg.local = &local;
-    var in: [cmdu.max_frame]u8 = undefined;
-    var out: [cmdu.max_frame]u8 = undefined;
-    const query = try frameFrom(&in, .topology_query, &.{.{ .type = .al_mac, .value = &ax12 }});
-    const tr: cmdu.Frame = try .parse((try c.onFrame(query, 0, &out, testSecrets())).?);
-    try testing.expectEqualSlices(u8, &.{ 2, cmdu.service_controller, cmdu.service_agent }, tr.find(.supported_service).?);
-
-    var ob: cmdu.OperationalBss = try .init(tr.find(.ap_operational_bss).?);
-    var r24 = (try ob.nextRadio()).?;
-    try testing.expectEqualSlices(u8, &c6_24, &r24.ruid);
-    const b24 = (try r24.nextBss()).?;
-    try testing.expectEqualSlices(u8, &c6_24, &b24.bssid);
-    try testing.expectEqualStrings("MK", b24.ssid);
-    try testing.expect(try r24.nextBss() == null);
-    var r5 = (try ob.nextRadio()).?;
-    try testing.expectEqualStrings("MK 5", (try r5.nextBss()).?.ssid);
-    try testing.expect(try ob.nextRadio() == null);
 }
 
 test "answers a higher layer query, even from a device it doesn't know" {
