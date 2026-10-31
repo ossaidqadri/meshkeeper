@@ -20,9 +20,9 @@ DONE WHEN: `logread -e meshkeeper` on the router shows "watching probe requests 
 2. **Find the router.** It's the default gateway: Windows `Get-NetRoute 0.0.0.0/0` (or `ipconfig`), macOS `route -n get default`, Linux `ip route`. Confirm it's OpenWrt with `ssh root@<gw> cat /etc/openwrt_release`, or by http://<gw>/ showing LuCI. Not OpenWrt: stop. meshkeeper needs OpenWrt 25.12 or later; installing OpenWrt is out of scope, point them to the [Table of Hardware](https://openwrt.org/toh/start).
 3. **SSH access.** Try key login (`ssh -o BatchMode=yes root@<gw> true`). If it needs a password, you can't type it: ask the person to add their public key in LuCI (System, Administration, SSH-Keys), creating one first with `ssh-keygen -t ed25519` if they have none, then retry.
 4. **Read-only checks**, in one ssh call:
-   `cat /etc/openwrt_release; apk --print-arch; apk info -e wpad-basic-mbedtls wpad-mbedtls; df -k /overlay; free`
+   `cat /etc/openwrt_release; apk info -e wpad-basic-mbedtls wpad-mbedtls; df -k /overlay; free`
    - Release `25.12` or later, else stop.
-   - Arch must be one of `mips_24kc`, `mipsel_24kc`, `arm_cortex-a7_neon-vfpv4`, `aarch64_cortex-a53`, `x86_64`; anything else is unsupported, stop.
+   - Arch is `DISTRIB_ARCH` in that file (`apk --print-arch` prints only the CPU family, e.g. `mips`). It must be one of `mips_24kc`, `mipsel_24kc`, `arm_cortex-a7_neon-vfpv4`, `aarch64_cortex-a53`, `x86_64`; anything else is unsupported, stop.
    - At least 1 MB free in `/overlay`.
    - Satellite: meshkeeper only helps with an EasyMesh satellite, e.g. a TP-Link AX12 on stock firmware (see the README's Tested on). Ask the person what they have; no satellite, stop.
 5. **Show findings and the plan** (steps 6 to 9 with the exact commands), and wait for a go-ahead.
