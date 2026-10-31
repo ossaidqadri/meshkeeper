@@ -254,14 +254,16 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// Streamed through a small buffer: full tables (4 agents x 32 clients) are
+/// ~19 KB, which as one buffer would stay resident on the stack.
 fn writeMesh(io: Io, ctl: *const Controller, now: i64) !void {
-    var buf: [32 * 1024]u8 = undefined; // full tables: 4 agents x 32 clients is ~19 KB
-    var w: Io.Writer = .fixed(&buf);
-    try ctl.writeMesh(&w, now);
-    const cwd = Io.Dir.cwd();
-    try cwd.createDirPath(io, mesh_dir);
-    try cwd.writeFile(io, .{ .sub_path = mesh_path ++ ".tmp", .data = w.buffered() });
-    try cwd.rename(mesh_path ++ ".tmp", cwd, mesh_path, io);
+    var af = try Io.Dir.cwd().createFileAtomic(io, mesh_path, .{ .make_path = true, .replace = true });
+    defer af.deinit(io);
+    var buf: [1024]u8 = undefined;
+    var fw = af.file.writer(io, &buf);
+    try ctl.writeMesh(&fw.interface, now);
+    try fw.interface.flush();
+    try af.replace(io);
 }
 
 fn send(sock: PacketSocket, observe: bool, frame: []const u8) void {
@@ -637,13 +639,13 @@ fn loadState(gpa: Allocator, io: Io, ctl: *Controller) void {
 
 /// Written only when something new was learned; atomic via rename.
 fn saveState(io: Io, ctl: *const Controller) !void {
-    var buf: [4096]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    try ctl.save(&w);
-    const cwd = Io.Dir.cwd();
-    try cwd.createDirPath(io, state_dir);
-    try cwd.writeFile(io, .{ .sub_path = state_path ++ ".tmp", .data = w.buffered() });
-    try cwd.rename(state_path ++ ".tmp", cwd, state_path, io);
+    var af = try Io.Dir.cwd().createFileAtomic(io, state_path, .{ .make_path = true, .replace = true });
+    defer af.deinit(io);
+    var buf: [1024]u8 = undefined;
+    var fw = af.file.writer(io, &buf);
+    try ctl.save(&fw.interface);
+    try fw.interface.flush();
+    try af.replace(io);
 }
 
 test {

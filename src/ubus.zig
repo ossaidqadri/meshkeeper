@@ -16,6 +16,8 @@ const max_msg = 1 << 20;
 /// for the CLI's 30 s.
 const timeout_ms = 5_000;
 const hdr_len = 8; // version, type, seq, peer
+/// Receive buffer kept between messages; probes and most replies fit.
+const keep_rx = 4096;
 
 const MsgType = enum(u8) { hello, status, data, ping, lookup, invoke, add_object, remove_object, subscribe, unsubscribe, notify, _ };
 const Attr = enum(u7) { unspec, status, objpath, objid, method, objtype, signature, data, target, active, no_reply, subscribers, user, group, _ };
@@ -181,6 +183,8 @@ pub const Conn = struct {
     /// Reads one whole message; it stays valid until the next read.
     fn recv(c: *Conn, gpa: Allocator) !Message {
         errdefer c.disconnect(); // the stream can't be resynchronised
+        // One big reply (get_clients on a busy AP) must not stay resident.
+        if (c.rx.capacity > keep_rx) c.rx.clearAndFree(gpa);
         try c.rx.resize(gpa, hdr_len + 4);
         try c.readExact(c.rx.items);
         const raw = mem.readInt(u32, c.rx.items[hdr_len..][0..4], .big) & len_mask;
