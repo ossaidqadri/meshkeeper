@@ -80,8 +80,12 @@ fn syslogLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
 
 const usage =
     \\usage: meshkeeper [--observe] [--config NAME]
+    \\       meshkeeper [--config NAME] --steer AGENT CLIENT FROM TO
     \\  --observe      decode and log, never send frames or open WPS
     \\  --config NAME  UCI config to read (default: meshkeeper)
+    \\  --steer        ask agent AGENT to move CLIENT from its BSS FROM to this
+    \\                 router's BSS TO, once, then exit; the running daemon logs
+    \\                 the answer (MACs as on the Mesh page)
     \\
 ;
 
@@ -124,11 +128,15 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var observe = false;
+    var steer: ?[]const []const u8 = null;
     var config_name: []const u8 = "meshkeeper";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--observe")) {
             observe = true;
+        } else if (std.mem.eql(u8, args[i], "--steer") and i + 4 < args.len) {
+            steer = args[i + 1 .. i + 5];
+            i += 4;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len and std.mem.indexOfScalar(u8, args[i + 1], '/') == null) {
             i += 1;
             config_name = args[i];
@@ -147,6 +155,7 @@ pub fn main(init: std.process.Init) !void {
     var settings = try loadSettings(settings_arena.allocator(), init.gpa, io, &bus, config_name);
     const sock = try PacketSocket.open(io, settings.interface);
     defer sock.close();
+    if (steer) |s| return steerOnce(io, sock, settings, s);
 
     var first_mid: u16 = undefined;
     io.random(std.mem.asBytes(&first_mid));
@@ -396,6 +405,30 @@ fn parseEvent(n: ubus.Subscriber.Notification) !?Event {
         .status = std.math.cast(u8, try n.data.int("status-code") orelse return null) orelse return null,
     } };
     return null;
+}
+
+/// `--steer`: one Client Steering Request, built as the controller builds it,
+/// so the whole path (agent, client, report) can be tested without waiting
+/// for a weak signal. prplMesh certifies steering the same way.
+fn steerOnce(io: Io, sock: PacketSocket, s: Settings, args: []const []const u8) !void {
+    var macs: [4]cmdu.Mac = undefined;
+    for (args, &macs) |text, *m| m.* = parseMacText(text) orelse {
+        std.debug.print("not a MAC: {s}\n{s}", .{ text, usage });
+        std.process.exit(2);
+    };
+    const agent, const sta, const from, const to = macs;
+    const local = for (s.local) |l| (if (std.mem.eql(u8, &l.bssid, &to)) break l) else {
+        std.debug.print("{s} is not one of this router's BSSes\n", .{args[3]});
+        std.process.exit(2);
+    };
+    var mid: u16 = undefined;
+    io.random(std.mem.asBytes(&mid));
+    const req = cmdu.steeringRequest(from, sta, local.target());
+    var tx: [cmdu.max_frame]u8 = undefined;
+    try sock.send(try cmdu.build(&tx, agent, sock.mac, .client_steering_request, mid, &.{
+        .{ .type = .steering_request, .value = &req },
+    }));
+    log.info("asked agent {x} to move {x} to {x}", .{ agent, sta, to });
 }
 
 /// "aa:bb:cc:dd:ee:ff", either case.

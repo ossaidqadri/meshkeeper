@@ -79,7 +79,7 @@ pub const LocalBss = struct {
     op_class: u8,
     channel: u8,
 
-    fn target(l: LocalBss) cmdu.SteerTarget {
+    pub fn target(l: LocalBss) cmdu.SteerTarget {
         return .{ .bssid = l.bssid, .op_class = l.op_class, .channel = l.channel };
     }
 };
