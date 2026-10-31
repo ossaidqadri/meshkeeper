@@ -12,6 +12,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = optimize != .debug,
+        // One poll loop, no threads: drops std's thread pool and locking.
+        .single_threaded = true,
     });
 
     const exe = b.addExecutable(.{ .name = "meshkeeper", .root_module = mod });

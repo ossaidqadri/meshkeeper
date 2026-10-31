@@ -26,6 +26,9 @@ pub const std_options: std.Options = .{
     // signal stack and the segfault handler that would print them are dead weight.
     .signal_stack_size = if (on_router) null else 1 << 18,
     .enable_segfault_handler = !on_router,
+    .allow_stack_tracing = !on_router,
+    // Sockets are raw linux calls; std's networking (DNS and all) is never used.
+    .networking = false,
 };
 
 /// Safety checks stay on (ReleaseSafe); a failed one logs and exits, and
