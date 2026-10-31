@@ -6,8 +6,11 @@ import pytest
 
 from conftest import sh
 
-# Measured 908 kB (RssAnon 152 kB) in the emulator after reading ubus replies in place, plus ~10% headroom.
-RSS_LIMIT_KB = 1000
+# Measured 452 kB resident, 124 kB of it private (RssAnon), once std was built for size and big
+# buffers stopped staying resident; ~10% headroom each. The private part is what the daemon
+# really costs: code pages are shared and the kernel can drop them.
+RSS_LIMIT_KB = 500
+ANON_LIMIT_KB = 140
 
 
 def pid(ssh):
@@ -58,6 +61,7 @@ def test_rss_and_binary_size(meshkeeper):
     size = int(sh(ssh, "wc -c < /usr/sbin/meshkeeper"))
     print(f"\nVmRSS {rss} kB (RssAnon {anon} kB), binary {size} bytes")
     assert rss < RSS_LIMIT_KB
+    assert anon < ANON_LIMIT_KB
 
 
 def test_upgrade_restarts_service(meshkeeper, request):
