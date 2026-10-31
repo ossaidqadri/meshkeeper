@@ -83,7 +83,7 @@ jobs:
             name=$(basename "$f" .apk)
             # The LuCI page is architecture independent: one leg ships it, unsuffixed.
             case "$name" in
-              luci-app-*) [ "$ARCH" = x86_64 ] && cp "$f" "out/$name.apk" ;;
+              luci-app-*) if [ "$ARCH" = x86_64 ]; then cp "$f" "out/$name.apk"; fi ;;
               *) cp "$f" "out/$name-$ARCH.apk" ;;
             esac
           done
