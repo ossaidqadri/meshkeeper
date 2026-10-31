@@ -2,3 +2,5 @@
 *
 !pyproject.toml
 !uv.lock
+# A downloaded OpenWrt SDK, used by Containerfile.sdk instead of fetching it again.
+!.cache/openwrt-sdk-*.tar.zst

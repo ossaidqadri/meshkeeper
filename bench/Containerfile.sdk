@@ -1,0 +1,31 @@
+# OpenWrt SDK for one target with its host tools and the pinned Zig, so a
+# package build only compiles. Built once per target by build-apks.sh.
+FROM debian:bookworm
+# See Containerfile: a faster Debian mirror when deb.debian.org is slow.
+ARG DEBIAN_MIRROR=
+RUN [ -z "$DEBIAN_MIRROR" ] || sed -i "s|http://deb.debian.org/debian$|$DEBIAN_MIRROR|" /etc/apt/sources.list.d/debian.sources
+RUN apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+	build-essential gawk gettext libncurses-dev libssl-dev zlib1g-dev xz-utils wget \
+	file curl zstd rsync unzip bzip2 python3 python3-setuptools swig perl ca-certificates git >/dev/null \
+ && rm -rf /var/lib/apt/lists/*
+ARG TARGET=ath79/generic
+ARG RELEASE=25.12.6
+# Name and checksum both come from the release (ipq40xx's SDK name can't be assembled by hand).
+# A copy already in bench/.cache is used instead of the 230 MB download; the checksum still applies.
+RUN --mount=type=bind,source=.cache,target=/cache \
+    base="https://downloads.openwrt.org/releases/$RELEASE/targets/$TARGET" \
+ && curl -fsSL -o /tmp/sums "$base/sha256sums" \
+ && grep 'openwrt-sdk-.*\.tar\.zst$' /tmp/sums > /tmp/sdk.sum \
+ && file=$(awk '{print $2}' /tmp/sdk.sum) && file=${file#\*} \
+ && if [ -f "/cache/$file" ]; then cp "/cache/$file" /tmp/; else curl -fsSL -o "/tmp/$file" "$base/$file"; fi \
+ && (cd /tmp && sha256sum -c sdk.sum) \
+ && mkdir /sdk && tar --zstd -xf "/tmp/$file" -C /sdk --strip-components=1 \
+ && rm "/tmp/$file"
+WORKDIR /sdk
+RUN make defconfig >/dev/null
+# The package Makefile's Download/zig finds it here instead of fetching it. Same version and hash.
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+RUN curl -fsSL -o dl/zig-x86_64-linux-$ZIG_VERSION.tar.xz https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz \
+ && echo "$ZIG_SHA256  dl/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | sha256sum -c -
