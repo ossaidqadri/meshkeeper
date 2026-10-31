@@ -113,7 +113,8 @@ define Package/meshkeeper/install
 	# Everything the package installs, so a sysupgrade keeps it (apk's own database is not kept).
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/meshkeeper $(1)/lib/upgrade/keep.d/meshkeeper
 	$(INSTALL_BIN) ./files/etc/init.d/meshkeeper $(1)/etc/init.d/meshkeeper
-	$(INSTALL_CONF) ./files/etc/config/meshkeeper $(1)/etc/config/meshkeeper
+	# 0644, not INSTALL_CONF's 0600: the daemon reads it as its own user, and it holds no secrets.
+	$(INSTALL_DATA) ./files/etc/config/meshkeeper $(1)/etc/config/meshkeeper
 	$(INSTALL_DATA) ./files/etc/capabilities/meshkeeper.json $(1)/etc/capabilities/meshkeeper.json
 	$(INSTALL_DATA) ./files/usr/share/acl.d/meshkeeper.json $(1)/usr/share/acl.d/meshkeeper.json
 endef
