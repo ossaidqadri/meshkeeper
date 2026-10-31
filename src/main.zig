@@ -503,7 +503,11 @@ fn openWps(gpa: Allocator, bus: *ubus.Conn, s: Settings, w: controller.WpsAction
     if (bus.call(gpa, obj, "wps_start", .{})) |r| {
         gpa.free(r);
         log.warn("opened WPS on {s} (window {d}); press WPS on the satellite", .{ obj, w.window });
-    } else |err| log.warn("wps_start on {s} failed: {t}", .{ obj, err });
+    } else |err| switch (err) {
+        // wpad-basic builds hostapd without WPS, e.g. after a sysupgrade to a stock image.
+        error.MethodNotFound => log.err("{s} has no WPS: install the full wpad (wpad-mbedtls) to re-pair satellites", .{obj}),
+        else => log.warn("wps_start on {s} failed: {t}", .{ obj, err }),
+    }
 }
 
 fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, config_name: []const u8) !Settings {
