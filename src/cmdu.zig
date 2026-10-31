@@ -25,6 +25,8 @@ pub const MsgType = enum(u16) {
     ap_autoconfig_response = 0x0008,
     ap_autoconfig_wsc = 0x0009,
     ap_autoconfig_renew = 0x000A,
+    higher_layer_query = 0x000D,
+    higher_layer_response = 0x000E,
     ack = 0x8000,
     ap_capability_query = 0x8001,
     ap_capability_report = 0x8002,
@@ -61,6 +63,8 @@ pub const Tlv = enum(u8) {
     supported_role = 0x0F,
     supported_freq_band = 0x10,
     wsc = 0x11,
+    device_identification = 0x15,
+    profile_version = 0x1A,
     supported_service = 0x80,
     searched_service = 0x81,
     ap_radio_identifier = 0x82,
@@ -185,6 +189,20 @@ pub fn deviceInfo(al_mac: Mac) [6 + 1 + 6 + 2 + 1]u8 {
     v[7..13].* = al_mac;
     mem.writeInt(u16, v[13..15], media_ieee_802_3ab, .big);
     v[15] = 0;
+    return v;
+}
+
+/// 1905 Profile Version TLV value for IEEE 1905.1a.
+pub const profile_1905_1a: u8 = 0x01;
+
+/// Device Identification TLV value (1905.1): friendly name, manufacturer and
+/// model, each a zero-padded 64-byte field (layout as in prplMesh tlvf).
+pub fn deviceIdentification(name: []const u8, manufacturer: []const u8, model: []const u8) [3 * 64]u8 {
+    var v: [3 * 64]u8 = @splat(0);
+    for ([_][]const u8{ name, manufacturer, model }, 0..) |s, i| {
+        const n = @min(s.len, 63);
+        @memcpy(v[i * 64 ..][0..n], s[0..n]);
+    }
     return v;
 }
 
