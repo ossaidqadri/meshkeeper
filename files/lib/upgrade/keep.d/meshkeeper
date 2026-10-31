@@ -1,1 +1,7 @@
+/usr/sbin/meshkeeper
+/etc/init.d/meshkeeper
+/etc/rc.d/S99meshkeeper
+/etc/capabilities/meshkeeper.json
+/usr/share/acl.d/meshkeeper.json
+/lib/upgrade/keep.d/meshkeeper
 /etc/meshkeeper/

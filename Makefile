@@ -79,10 +79,38 @@ define Package/meshkeeper/conffiles
 /etc/config/meshkeeper
 endef
 
+# Fresh installs only: files restored by sysupgrade have no owner, so apk would leave the new ones as .apk-new.
+define Package/meshkeeper/preinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || [ "$${PKG_UPGRADE}" = 1 ] || rm -f /etc/init.d/meshkeeper /etc/capabilities/meshkeeper.json
+endef
+
+# owut builds the new image on a server that has no meshkeeper package, so tell it to drop both.
+define Package/meshkeeper/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || ! uci -q get attendedsysupgrade.owut >/dev/null || {
+	for p in meshkeeper luci-app-meshkeeper; do
+		uci -q del_list attendedsysupgrade.owut.remove="$$p/if-installed"
+		uci add_list attendedsysupgrade.owut.remove="$$p/if-installed"
+	done
+	uci commit attendedsysupgrade
+}
+endef
+
+define Package/meshkeeper/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || ! uci -q get attendedsysupgrade.owut >/dev/null || {
+	for p in meshkeeper luci-app-meshkeeper; do
+		uci -q del_list attendedsysupgrade.owut.remove="$$p/if-installed"
+	done
+	uci commit attendedsysupgrade
+}
+endef
+
 define Package/meshkeeper/install
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/etc/capabilities $(1)/usr/share/acl.d $(1)/lib/upgrade/keep.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/zig-out/bin/meshkeeper $(1)/usr/sbin/meshkeeper
-	# The learned state is written at runtime, so sysupgrade only keeps it if told to.
+	# Everything the package installs, so a sysupgrade keeps it (apk's own database is not kept).
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/meshkeeper $(1)/lib/upgrade/keep.d/meshkeeper
 	$(INSTALL_BIN) ./files/etc/init.d/meshkeeper $(1)/etc/init.d/meshkeeper
 	$(INSTALL_CONF) ./files/etc/config/meshkeeper $(1)/etc/config/meshkeeper
@@ -102,7 +130,8 @@ define Package/luci-app-meshkeeper
 endef
 
 define Package/luci-app-meshkeeper/install
-	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/meshkeeper
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/meshkeeper $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/luci-app-meshkeeper $(1)/lib/upgrade/keep.d/luci-app-meshkeeper
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./files/www/luci-static/resources/view/meshkeeper/mesh.js $(1)/www/luci-static/resources/view/meshkeeper/mesh.js
 	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-meshkeeper.json $(1)/usr/share/luci/menu.d/luci-app-meshkeeper.json
