@@ -113,6 +113,7 @@ pub const Client = struct {
     downlink_mbps: u32 = 0,
     uplink_mbps: u32 = 0,
     metrics_at: ?Ms = null,
+    metrics_asked: ?Ms = null,
     /// Best recent reading of a router BSS on the same band.
     heard: ?Heard = null,
     beacon_query_at: ?Ms = null,
@@ -265,6 +266,24 @@ pub const Agent = struct {
     fn fronthaulBss(a: Agent, band: Band, ssid: []const u8) ?Mac {
         for (a.radios[0..a.n_radios]) |r| if (r.band == band) return r.bssOf(ssid);
         return null;
+    }
+
+    /// The client to ask about next. Steering only trusts readings younger than
+    /// `reading_fresh`, which round robin can't keep up past 3 clients, so a
+    /// client steering watches (weak here, or just heard by the router) goes
+    /// first once its last ask is about to age out.
+    // ponytail: two or more watched clients take every slot and the rest of the
+    // mesh view goes stale; interleave round robin if that shows up.
+    fn metricsTarget(a: *Agent, now: Ms, steering: bool) *Client {
+        if (steering) for (a.clients[0..a.n_clients]) |*cl| {
+            const due = if (cl.metrics_asked) |t| now - t >= timing.reading_fresh - timing.metrics_interval else true;
+            const weak = if (cl.rssi) |r| r < agent_weak else false;
+            const heard = if (cl.heard) |h| now - h.at <= timing.reading_fresh else false;
+            if (due and (weak or heard)) return cl;
+        };
+        if (a.next_metrics >= a.n_clients) a.next_metrics = 0;
+        defer a.next_metrics += 1;
+        return &a.clients[a.next_metrics];
     }
 
     fn silent(a: Agent, now: Ms) bool {
@@ -663,9 +682,6 @@ pub const Controller = struct {
     }
 
     /// An agent client the router hears clearly better: steering request frame.
-    // ponytail: link metrics go round robin, one client per 10 s, so with more
-    // than 3 agent clients a reading is older than `reading_fresh` and this never
-    // fires; query the client the router just heard instead if that matters.
     fn steerFromAgent(c: *Controller, a: *Agent, now: Ms, out: []u8) !?[]const u8 {
         for (a.clients[0..a.n_clients]) |*cl| {
             const rssi = cl.rssi orelse continue;
@@ -745,9 +761,9 @@ pub const Controller = struct {
             }
             if (a.n_clients > 0 and (if (a.last_metrics_query) |t| now - t > timing.metrics_interval else true)) {
                 a.last_metrics_query = now;
-                if (a.next_metrics >= a.n_clients) a.next_metrics = 0;
-                const sta = a.clients[a.next_metrics].mac;
-                a.next_metrics += 1;
+                const cl = a.metricsTarget(now, c.cfg.steering != .off);
+                cl.metrics_asked = now;
+                const sta = cl.mac;
                 return .{ .frame = try cmdu.build(out, a.al_mac, c.cfg.al_mac, .assoc_sta_link_metrics_query, c.mid(), &.{
                     .{ .type = .sta_mac_address, .value = &sta },
                 }) };
@@ -1290,6 +1306,57 @@ test "state survives a save/load round trip" {
     try testing.expectEqual(Band.@"5", a.radios[0].band.?);
     try testing.expectEqualSlices(u8, &digestOf(want5), &a.radios[0].applied.?);
     try testing.expect(!d.dirty);
+}
+
+test "steering from a busy agent: a weak client the router hears is measured next" {
+    // Probes at every point of a 55 s round robin cycle.
+    var probe_at: Ms = 100 * std.time.ms_per_s;
+    while (probe_at < 155 * std.time.ms_per_s) : (probe_at += std.time.ms_per_s) {
+        try testing.expect(try steerDelay(probe_at) <= 12 * std.time.ms_per_s);
+    }
+}
+
+/// How long after the router hears a weak client of a 5-client agent the
+/// steering request goes out.
+fn steerDelay(probe_at: Ms) !Ms {
+    const c6_5g: Mac = .{ 0x02, 0x00, 0x00, 0xc6, 0x00, 0x40 };
+    const local = [_]LocalBss{.{ .bssid = c6_5g, .band = .@"5", .op_class = 128, .channel = 149 }};
+    var c = testController(false);
+    c.cfg.steering = .on;
+    c.cfg.local = &local;
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    const s = std.time.ms_per_s;
+    _ = try c.onFrame(try topologyWithSsid(&in, "MK 5GHz Ext"), 0, &out, testSecrets());
+    _ = try c.onFrame(try m1Frame(&in), 0, &out, testSecrets());
+    const a = c.agent(ax12).?;
+    a.caps = @bitCast(@as(u8, 0x20));
+
+    // Five clients, as on the live AX12: round robin alone visits each every
+    // 55 s, longer than a reading stays fresh. The last one is weak.
+    const phone: Mac = .{ 0x02, 0, 0, 0, 0, 0xa5 };
+    for (0..5) |i| {
+        const joined = [_]u8{ 0x02, 0, 0, 0, 0, 0xa1 + @as(u8, @intCast(i)) } ++ radio5 ++ [_]u8{0x80};
+        _ = try c.onFrame(try frameFrom(&in, .topology_notification, &.{.{ .type = .client_association_event, .value = &joined }}), s, &out, testSecrets());
+    }
+
+    var t: Ms = 2 * s;
+    while (t < 250 * s) : (t += s) {
+        if (t == probe_at) c.onProbe(phone, t, .{ .bss = 0, .rssi = -62, .at = t });
+        const f = (try c.tick(t, &out)).frame orelse continue;
+        const frame: cmdu.Frame = try .parse(f);
+        switch (frame.msg_type) {
+            .assoc_sta_link_metrics_query => {
+                const sta = frame.find(.sta_mac_address).?[0..6].*;
+                const rcpi: u8 = if (std.mem.eql(u8, &sta, &phone)) 60 else 120; // -80 or -50 dBm
+                const lm = sta ++ [_]u8{1} ++ radio5 ++ [_]u8{ 0, 0, 0, 10, 0, 0, 1, 0x90, 0, 0, 0, 0xc8, rcpi };
+                _ = try c.onFrame(try frameFrom(&in, .assoc_sta_link_metrics_response, &.{.{ .type = .associated_sta_link_metrics, .value = &lm }}), t, &out, testSecrets());
+            },
+            .client_steering_request => return t - probe_at,
+            else => {},
+        }
+    }
+    return error.NeverSteered;
 }
 
 test "fuzz: random frames from a known agent never crash the controller" {
