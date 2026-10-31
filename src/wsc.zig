@@ -330,3 +330,46 @@ test "M1 parse rejects non-M1 and truncated input" {
     try std.testing.expectError(error.NotM1, M1.parse(&.{ 0x10, 0x22, 0x00, 0x01, msg_m2 }));
     try std.testing.expectError(error.Truncated, M1.parse(&.{ 0x10, 0x22, 0x00, 0x09, msg_m1 }));
 }
+
+test "fuzz: random M1s never crash the parser or M2 builder" {
+    var prng: std.Random.DefaultPrng = .init(0x5c);
+    const rand = prng.random();
+    const attrs = [_]Attr{ .msg_type, .mac, .enrollee_nonce, .public_key, .rf_bands, .auth_type_flags, .encr_type_flags, .vendor_ext };
+    var buf: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    var secrets: Secrets = undefined;
+    rand.bytes(mem.asBytes(&secrets));
+    var m2s: usize = 0;
+    for (0..20_000) |i| {
+        var w: Io.Writer = .fixed(&buf);
+        if (i % 2 == 0) {
+            const len = rand.uintAtMost(usize, buf.len);
+            rand.bytes(buf[0..len]);
+            w.end = len;
+        } else {
+            // Well-formed attributes, lengths usually right, so parsing gets past
+            // the attribute walk and the length checks.
+            var value: [dh_len]u8 = undefined;
+            for (0..rand.uintAtMost(usize, 8)) |_| {
+                const t = attrs[rand.uintLessThan(usize, attrs.len)];
+                const right: usize = switch (t) {
+                    .msg_type, .rf_bands => 1,
+                    .auth_type_flags, .encr_type_flags => 2,
+                    .mac => 6,
+                    .enrollee_nonce => 16,
+                    .public_key => dh_len,
+                    else => 3,
+                };
+                const n = if (rand.uintLessThan(u8, 8) == 0) rand.uintAtMost(usize, value.len) else right;
+                rand.bytes(value[0..n]);
+                if (t == .msg_type and rand.boolean()) value[0] = msg_m1;
+                putAttr(&w, t, value[0..n]) catch break;
+            }
+        }
+        const m1 = M1.parse(w.buffered()) catch continue;
+        // DH is slow in a debug build; a few hostile public keys are enough.
+        if (m2s == 32) continue;
+        m2s += 1;
+        _ = buildM2(&out, m1, .{ .ssid = "s", .passphrase = "password" }, &@splat(0), secrets) catch {};
+    }
+}
