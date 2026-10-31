@@ -14,7 +14,7 @@ TP-Link Archer C6 v2 (US) on OpenWrt 25.12.6 as the main router, TP-Link Archer 
 
 ### 1. Router Wi-Fi
 
-WPS needs a full wpad, not `wpad-basic`: `apk del wpad-basic-mbedtls && apk add wpad-mbedtls`. Add a hidden backhaul network on the radio the satellite will use, and point your 5 GHz network's WPS at it:
+WPS needs a full wpad, not `wpad-basic`: `apk del wpad-basic-mbedtls && apk add wpad-mbedtls && /etc/init.d/wpad restart`. Add a hidden backhaul network on the radio the satellite will use, and point your 5 GHz network's WPS at it:
 
 ```
 config wifi-iface 'meshbh'
