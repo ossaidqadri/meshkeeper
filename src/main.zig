@@ -17,10 +17,26 @@ const ubus = @import("ubus.zig");
 const controller = @import("controller.zig");
 const Controller = controller.Controller;
 
+const on_router = builtin.os.tag == .linux and !builtin.is_test;
+
 pub const std_options: std.Options = .{
     .log_level = .info,
-    .logFn = if (builtin.os.tag == .linux and !builtin.is_test) syslogLog else std.log.defaultLog,
+    .logFn = if (on_router) syslogLog else std.log.defaultLog,
+    // Stripped release binaries have no stack traces to print, so the 256 KB
+    // signal stack and the segfault handler that would print them are dead weight.
+    .signal_stack_size = if (on_router) null else 1 << 18,
+    .enable_segfault_handler = !on_router,
 };
+
+/// Safety checks stay on (ReleaseSafe); a failed one logs and exits, and
+/// procd restarts the service.
+pub const panic = if (on_router) std.debug.FullPanic(struct {
+    fn panic(msg: []const u8, _: ?usize) noreturn {
+        log.err("panic: {s}", .{msg});
+        std.process.abort();
+    }
+}.panic) else std.debug.FullPanic(std.debug.defaultPanic);
+
 const log = std.log.scoped(.main);
 
 /// Logs to syslog with each message's own severity. procd files everything a
@@ -324,7 +340,6 @@ const PacketSocket = struct {
 /// hostapd notifications (probe requests, 802.11v answers) from a ubus subscription.
 const ProbeFeed = struct {
     sub: ubus.Subscriber = .{},
-    line: [8192]u8 = undefined,
 
     fn start(feed: *ProbeFeed, gpa: Allocator, bus: *ubus.Conn, objects: []const []const u8) !void {
         // hostapd only reports probes to subscribers once notify_response is set.
@@ -335,27 +350,42 @@ const ProbeFeed = struct {
 
     /// One message per poll wakeup. False once the subscription ended.
     fn drain(feed: *ProbeFeed, gpa: Allocator, ctl: *Controller, settings: Settings, now: i64) bool {
-        var w: Io.Writer = .fixed(&feed.line);
-        const event = feed.sub.next(gpa, &w) catch |err| return err == error.WriteFailed; // oversized event: drop it
-        if (event) handleEvent(w.buffered(), ctl, settings, now);
+        const n = feed.sub.next(gpa) catch return false;
+        // A malformed or unknown event is dropped; the subscription goes on.
+        const ev = parseEvent(n orelse return true) catch return true;
+        switch (ev orelse return true) {
+            .btm_answer => |a| ctl.onBtmAnswer(a.sta, a.status),
+            .probe => |p| {
+                const bss = settings.localIndex(p.ifname);
+                const heard: ?controller.Heard = if (bss != null and p.signal != null)
+                    .{ .bss = bss.?, .rssi = std.math.lossyCast(i8, p.signal.?), .at = now }
+                else
+                    null;
+                ctl.onProbe(p.sta, now, heard);
+            },
+        }
         return true;
     }
-
-    fn handleEvent(line: []const u8, ctl: *Controller, settings: Settings, now: i64) void {
-        // Probes arrive often (every client scan); parse without touching the heap.
-        var scratch: [4096]u8 = undefined;
-        var fba: std.heap.FixedBufferAllocator = .init(&scratch);
-        const ev = parseEvent(fba.allocator(), line) catch return;
-        if (ev.@"bss-transition-response") |r| if (parseMacText(r.address)) |sta| ctl.onBtmAnswer(sta, r.@"status-code");
-        const probe = ev.probe orelse return;
-        const mac = parseMacText(probe.address) orelse return;
-        const heard: ?controller.Heard = if (settings.localIndex(probe.ifname)) |bss| (if (probe.signal) |sig|
-            .{ .bss = bss, .rssi = std.math.lossyCast(i8, sig), .at = now }
-        else
-            null) else null;
-        ctl.onProbe(mac, now, heard);
-    }
 };
+
+const Event = union(enum) {
+    probe: struct { sta: cmdu.Mac, ifname: []const u8, signal: ?i64 },
+    btm_answer: struct { sta: cmdu.Mac, status: u8 },
+};
+
+fn parseEvent(n: ubus.Subscriber.Notification) !?Event {
+    const sta = parseMacText(try n.data.string("address") orelse return null) orelse return null;
+    if (std.mem.eql(u8, n.method, "probe")) return .{ .probe = .{
+        .sta = sta,
+        .ifname = try n.data.string("ifname") orelse "",
+        .signal = try n.data.int("signal"),
+    } };
+    if (std.mem.eql(u8, n.method, "bss-transition-response")) return .{ .btm_answer = .{
+        .sta = sta,
+        .status = std.math.cast(u8, try n.data.int("status-code") orelse return null) orelse return null,
+    } };
+    return null;
+}
 
 /// "aa:bb:cc:dd:ee:ff", either case.
 fn parseMacText(text: []const u8) ?cmdu.Mac {
@@ -408,65 +438,58 @@ fn pollLocalClients(gpa: Allocator, bus: *ubus.Conn, s: Settings, ctl: *Controll
     for (s.local_objects, 0..) |obj, bss| {
         const raw = bus.call(gpa, obj, "get_clients", .{}) catch continue;
         defer gpa.free(raw);
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-        n += parseClients(arena.allocator(), raw, @intCast(bss), list[n..]) catch continue;
+        n += parseClients(.{ .rest = raw }, @intCast(bss), list[n..]) catch continue;
     }
     ctl.setLocalClients(list[0..n], now);
 }
 
 /// hostapd `get_clients` output into `out`; returns how many were filled.
-fn parseClients(arena: Allocator, raw: []const u8, bss: u8, out: []controller.LocalClient) !usize {
-    const Clients = struct { clients: std.json.ArrayHashMap(struct { signal: ?i32 = null, extended_capabilities: []const u8 = &.{} }) = .{} };
-    const parsed = try std.json.parseFromSliceLeaky(Clients, arena, raw, .{ .ignore_unknown_fields = true });
+fn parseClients(reply: ubus.List, bss: u8, out: []controller.LocalClient) !usize {
+    var clients = try reply.list("clients") orelse return 0;
     var n: usize = 0;
-    var it = parsed.clients.map.iterator();
-    while (it.next()) |e| {
+    while (try clients.next()) |e| {
         if (n == out.len) break;
-        const mac = parseMacText(e.key_ptr.*) orelse continue;
-        const sig = e.value_ptr.signal orelse continue;
+        const mac = parseMacText(e.name) orelse continue;
+        const client = e.value.asList() orelse continue;
+        const sig = try client.int("signal") orelse continue;
         // Extended Capabilities bit 19: BSS Transition (802.11v).
-        const caps = e.value_ptr.extended_capabilities;
-        const btm = caps.len > 2 and caps[2] & 0x08 != 0;
+        var btm = false;
+        if (try client.list("extended_capabilities")) |caps| {
+            var it = caps;
+            var k: usize = 0;
+            while (try it.next()) |octet| : (k += 1) if (k == 2) {
+                btm = (octet.value.asInt() orelse 0) & 0x08 != 0;
+                break;
+            };
+        }
         out[n] = .{ .mac = mac, .bss = bss, .rssi = std.math.lossyCast(i8, sig), .btm = btm };
         n += 1;
     }
     return n;
 }
 
-const Event = struct {
-    probe: ?struct { address: []const u8, ifname: []const u8 = "", signal: ?i32 = null } = null,
-    @"bss-transition-response": ?struct { address: []const u8, @"status-code": u8 } = null,
-};
-
-fn parseEvent(fba: Allocator, line: []const u8) !Event {
-    return std.json.parseFromSliceLeaky(Event, fba, line, .{ .ignore_unknown_fields = true });
-}
-
 test "hostapd output as captured on the C6" {
-    var buf: [8192]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buf);
-    const clients =
-        \\{"freq":5745,"clients":{"02:00:00:00:c0:de":{"auth":true,"rrm":[114,0,0,0,0],
-        \\"extended_capabilities":[4,0,136,128,1,64,0,192,0,0],"aid":1,"rate":{"rx":2170000,"tx":19510000},"signal":-74},
-        \\"02:00:00:00:00:01":{"extended_capabilities":[4,0,0],"signal":-50},"02:00:00:00:00:02":{"auth":true}}}
-    ;
+    const t = std.testing;
+    const vectors = @import("testdata/blobmsg_vectors.zig");
+    var bytes: [2048]u8 = undefined;
     var list: [4]controller.LocalClient = undefined;
-    const n = try parseClients(fba.allocator(), clients, 0, &list);
-    try std.testing.expectEqual(2, n);
-    try std.testing.expectEqual(-74, list[0].rssi);
-    try std.testing.expect(list[0].btm);
-    try std.testing.expect(!list[1].btm);
+    const n = try parseClients(.{ .rest = try std.fmt.hexToBytes(&bytes, vectors.cases[5].hex) }, 0, &list);
+    try t.expectEqual(2, n);
+    try t.expectEqual(-74, list[0].rssi);
+    try t.expect(list[0].btm);
+    try t.expect(!list[1].btm);
 
-    const probe = try parseEvent(fba.allocator(),
-        \\{ "probe": {"address":"02:00:00:00:be:ef","ifname":"phy1-ap0","target":"ff:ff:ff:ff:ff:ff","signal":-62,"freq":2412,"ht_capabilities":{"ht_capabilities_info":11520}} }
-    );
-    try std.testing.expectEqual(-62, probe.probe.?.signal.?);
-    try std.testing.expectEqualStrings("phy1-ap0", probe.probe.?.ifname);
-    const answer = try parseEvent(fba.allocator(),
-        \\{ "bss-transition-response": {"address":"02:00:00:00:c0:de","dialog-token":1,"status-code":1,"bss-termination-delay":0} }
-    );
-    try std.testing.expectEqual(1, answer.@"bss-transition-response".?.@"status-code");
+    const probe = (try parseEvent(.{ .method = "probe", .data = .{ .rest = try std.fmt.hexToBytes(&bytes, vectors.cases[6].hex) } })).?.probe;
+    try t.expectEqual(-62, probe.signal.?);
+    try t.expectEqualStrings("phy1-ap0", probe.ifname);
+    try t.expectEqual(0xef, probe.sta[5]);
+
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try ubus.putFields(&w, .{ .address = "02:00:00:00:c0:de", .@"dialog-token" = 1, .@"status-code" = 1, .@"bss-termination-delay" = 0 });
+    const answer = (try parseEvent(.{ .method = "bss-transition-response", .data = .{ .rest = w.buffered() } })).?.btm_answer;
+    try t.expectEqual(1, answer.status);
+    try t.expectEqual(null, try parseEvent(.{ .method = "assoc", .data = .{ .rest = w.buffered() } }));
 }
 
 fn openWps(gpa: Allocator, bus: *ubus.Conn, s: Settings, w: controller.WpsAction) void {
@@ -487,12 +510,24 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, confi
     const own = try readUci(arena, io, config_name);
     const main_section = own.section("main") orelse return error.MissingMainSection;
     const wifi = try readUci(arena, io, "wireless");
-    const opts: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
 
+    // Every wifi-iface that is up: its UCI section and its hostapd object.
     const status_raw = try bus.call(gpa, "network.wireless", "status", .{});
     defer gpa.free(status_raw);
-    const Status = std.json.ArrayHashMap(struct { interfaces: []const struct { section: []const u8, ifname: ?[]const u8 = null } = &.{} });
-    const status = try std.json.parseFromSliceLeaky(Status, arena, status_raw, opts);
+    const Up = struct { section: []const u8, object: []const u8 };
+    var up: std.ArrayList(Up) = .empty;
+    var radios: ubus.List = .{ .rest = status_raw };
+    while (try radios.next()) |radio| {
+        var ifaces = try (radio.value.asList() orelse continue).list("interfaces") orelse continue;
+        while (try ifaces.next()) |e| {
+            const iface = e.value.asList() orelse continue;
+            const ifname = try iface.string("ifname") orelse continue;
+            try up.append(arena, .{
+                .section = try iface.string("section") orelse continue,
+                .object = try std.mem.concat(arena, u8, &.{ "hostapd.", ifname }),
+            });
+        }
+    }
 
     const suffix = main_section.get("ssid_suffix") orelse "";
     var fronthaul: [2]?wsc.Bss = .{ null, null };
@@ -514,26 +549,25 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, confi
         const full_ssid = try std.mem.concat(arena, u8, &.{ ssid, suffix });
         if (full_ssid.len > 32) return error.SsidTooLong;
         fronthaul[band] = .{ .ssid = full_ssid, .passphrase = passphrase };
-        const obj = try hostapdObject(arena, status, section) orelse continue;
+        const obj = for (up.items) |u| {
+            if (std.mem.eql(u8, u.section, section)) break u.object;
+        } else continue;
         if (band == 1) wps_object = obj;
-        if (localBss(arena, gpa, bus, obj)) |bss| {
+        if (localBss(gpa, bus, obj)) |bss| {
             try local.append(arena, bss);
             try local_objects.append(arena, obj);
         } else |err| log.warn("{s} get_status: {t}", .{ obj, err });
     }
 
-    var objects: std.ArrayList([]const u8) = .empty;
-    for (status.map.values()) |radio| for (radio.interfaces) |iface| {
-        const ifname = iface.ifname orelse continue;
-        try objects.append(arena, try std.mem.concat(arena, u8, &.{ "hostapd.", ifname }));
-    };
+    const objects = try arena.alloc([]const u8, up.items.len);
+    for (up.items, objects) |u, *o| o.* = u.object;
 
     return .{
         .interface = main_section.get("interface") orelse "br-lan",
         .fronthaul = fronthaul,
         .auto_wps = std.mem.eql(u8, main_section.get("auto_wps") orelse "0", "1"),
         .wps_object = wps_object,
-        .hostapd_objects = objects.items,
+        .hostapd_objects = objects,
         .steering = steering: {
             const v = main_section.get("steering") orelse "0";
             if (std.mem.eql(u8, v, "1")) break :steering .on;
@@ -545,26 +579,20 @@ fn loadSettings(arena: Allocator, gpa: Allocator, io: Io, bus: *ubus.Conn, confi
     };
 }
 
-fn localBss(arena: Allocator, gpa: Allocator, bus: *ubus.Conn, obj: []const u8) !controller.LocalBss {
+fn localBss(gpa: Allocator, bus: *ubus.Conn, obj: []const u8) !controller.LocalBss {
     const raw = try bus.call(gpa, obj, "get_status", .{});
     defer gpa.free(raw);
-    const Status = struct { bssid: []const u8, freq: u32, channel: u8, op_class: u8 };
-    const st = try std.json.parseFromSliceLeaky(Status, arena, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    const st: ubus.List = .{ .rest = raw };
     return .{
-        .bssid = parseMacText(st.bssid) orelse return error.BadBssid,
-        .band = .fromMhz(st.freq),
-        .op_class = st.op_class,
-        .channel = st.channel,
+        .bssid = parseMacText(try st.string("bssid") orelse "") orelse return error.BadBssid,
+        .band = .fromMhz(try uintField(u32, st, "freq")),
+        .op_class = try uintField(u8, st, "op_class"),
+        .channel = try uintField(u8, st, "channel"),
     };
 }
 
-fn hostapdObject(arena: Allocator, status: anytype, section: []const u8) !?[]const u8 {
-    for (status.map.values()) |radio| for (radio.interfaces) |iface| {
-        if (!std.mem.eql(u8, iface.section, section)) continue;
-        const ifname = iface.ifname orelse return null;
-        return try std.mem.concat(arena, u8, &.{ "hostapd.", ifname });
-    };
-    return null;
+fn uintField(comptime T: type, l: ubus.List, name: []const u8) !T {
+    return std.math.cast(T, try l.int(name) orelse return error.MissingField) orelse error.OutOfRange;
 }
 
 /// Reads /etc/config/<name> directly, as the service user: file permissions

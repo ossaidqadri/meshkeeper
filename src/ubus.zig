@@ -1,7 +1,6 @@
 //! ubus over ubusd's unix socket: libubus's wire format and blobmsg encoding,
 //! without libubus and without starting a `ubus` process for every call.
-//! Replies come back as the JSON `ubus call` prints, so callers keep parsing
-//! them with std.json.
+//! Replies are read in place as blobmsg (`List`), never turned into JSON.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -17,7 +16,6 @@ const max_msg = 1 << 20;
 /// for the CLI's 30 s.
 const timeout_ms = 5_000;
 const hdr_len = 8; // version, type, seq, peer
-const max_depth = 16;
 
 const MsgType = enum(u8) { hello, status, data, ping, lookup, invoke, add_object, remove_object, subscribe, unsubscribe, notify, _ };
 const Attr = enum(u7) { unspec, status, objpath, objid, method, objtype, signature, data, target, active, no_reply, subscribers, user, group, _ };
@@ -64,8 +62,8 @@ pub const Conn = struct {
     }
 
     /// `ubus call <path> <method>` with `args` (a struct, or `.{}`) as the
-    /// message. Returns the reply as JSON, empty when there was none; the
-    /// caller frees it.
+    /// message. Returns the reply table's members (read them with `List`),
+    /// empty when there was none; the caller frees it.
     pub fn call(c: *Conn, gpa: Allocator, path: []const u8, method: []const u8, args: anytype) ![]u8 {
         var buf: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
@@ -89,17 +87,19 @@ pub const Conn = struct {
         try end(&w, root);
         const seq = try c.request(&buf, w.end, .invoke, id);
 
-        var out: Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
+        // Copied out: the status message that follows reuses the receive buffer.
+        var out: []u8 = &.{};
+        errdefer gpa.free(out);
         while (true) {
             const m = try c.recvReply(gpa, seq, id);
             if (m.type == .data) if (m.attrs[@backingInt(Attr.data)]) |d| {
-                out.clearRetainingCapacity(); // one reply; keep the last if there were more
-                try writeList(&out.writer, d, false, 0);
+                gpa.free(out); // one reply; keep the last if there were more
+                out = &.{};
+                out = try gpa.dupe(u8, d);
             };
             if (m.type == .status) {
                 try check(m);
-                return out.toOwnedSlice();
+                return out;
             }
         }
     }
@@ -266,12 +266,15 @@ pub const Subscriber = struct {
         s.conn.disconnect();
     }
 
-    /// Reads one message once poll says the socket is readable. Writes a
-    /// notification to `out` as `{"<type>":<data>}` (what `ubus subscribe`
-    /// prints) and returns true; false for anything else. An error means
-    /// the subscription ended: ubusd went away, or a target object did (a
-    /// Wi-Fi reload), which ubusd reports as an unsubscribe.
-    pub fn next(s: *Subscriber, gpa: Allocator, out: *Io.Writer) !bool {
+    /// One notification: its type (e.g. "probe") and its data table. Valid
+    /// until the next read.
+    pub const Notification = struct { method: []const u8, data: List };
+
+    /// Reads one message once poll says the socket is readable: a
+    /// notification, or null for anything else. An error means the
+    /// subscription ended: ubusd went away, or a target object did (a Wi-Fi
+    /// reload), which ubusd reports as an unsubscribe.
+    pub fn next(s: *Subscriber, gpa: Allocator) !?Notification {
         const m = try s.conn.recv(gpa);
         switch (m.type) {
             .unsubscribe => {
@@ -281,17 +284,12 @@ pub const Subscriber = struct {
             .invoke => {
                 const ours = m.word(.objid) == s.id;
                 try s.conn.ack(m, ours);
-                if (!ours) return false;
-                const method = m.string(.method) orelse return false;
-                const data = m.attrs[@backingInt(Attr.data)] orelse return false;
-                try out.writeByte('{');
-                try std.json.Stringify.encodeJsonString(method, .{}, out);
-                try out.writeByte(':');
-                try writeList(out, data, false, 0);
-                try out.writeByte('}');
-                return true;
+                if (!ours) return null;
+                const method = m.string(.method) orelse return null;
+                const data = m.attrs[@backingInt(Attr.data)] orelse return null;
+                return .{ .method = method, .data = .{ .rest = data } };
             },
-            else => return false,
+            else => return null,
         }
     }
 };
@@ -383,7 +381,7 @@ fn putString(w: *Io.Writer, id: u7, name: ?[]const u8, v: []const u8) !void {
 }
 
 /// A struct's fields as the members of a blobmsg table.
-fn putFields(w: *Io.Writer, args: anytype) !void {
+pub fn putFields(w: *Io.Writer, args: anytype) !void {
     inline for (@typeInfo(@TypeOf(args)).@"struct".field_names) |n| try putValue(w, n, @field(args, n));
 }
 
@@ -455,40 +453,74 @@ fn named(b: Blob) !struct { name: []const u8, value: []const u8 } {
     return .{ .name = b.data[2..][0..n], .value = b.data[hdr..] };
 }
 
-/// A blobmsg table's or array's members as JSON, like blobmsg_format_json.
-fn writeList(w: *Io.Writer, list: []const u8, array: bool, depth: usize) !void {
-    if (depth == max_depth) return error.Malformed;
-    try w.writeByte(if (array) '[' else '{');
-    var it: Iter = .{ .rest = list };
-    var first = true;
-    while (try it.next()) |b| {
+/// A blobmsg table's or array's members, read in place. Array members have
+/// empty names. Every length is checked, so hostile input only ever yields
+/// error.Malformed.
+pub const List = struct {
+    rest: []const u8,
+
+    pub const Value = union(enum) {
+        /// int8 (also booleans), int16, int32 or int64.
+        int: i64,
+        string: []const u8,
+        list: List,
+        /// unspec (null) or double; nothing meshkeeper reads is either.
+        other,
+
+        pub fn asInt(v: Value) ?i64 {
+            return if (v == .int) v.int else null;
+        }
+
+        pub fn asString(v: Value) ?[]const u8 {
+            return if (v == .string) v.string else null;
+        }
+
+        pub fn asList(v: Value) ?List {
+            return if (v == .list) v.list else null;
+        }
+    };
+
+    pub const Member = struct { name: []const u8, value: Value };
+
+    pub fn next(l: *List) !?Member {
+        var it: Iter = .{ .rest = l.rest };
+        const b = try it.next() orelse return null;
+        l.rest = it.rest;
         const e = try named(b);
-        if (!first) try w.writeByte(',');
-        first = false;
-        if (!array) {
-            try std.json.Stringify.encodeJsonString(e.name, .{}, w);
-            try w.writeByte(':');
-        }
         const v = e.value;
-        switch (@as(Type, @fromBackingInt(b.id))) {
-            .unspec => try w.writeAll("null"),
-            .int8 => try w.writeAll(if ((try exact(1, v))[0] != 0) "true" else "false"),
-            .int16 => try w.print("{d}", .{mem.readInt(i16, try exact(2, v), .big)}),
-            .int32 => try w.print("{d}", .{mem.readInt(i32, try exact(4, v), .big)}),
-            .int64 => try w.print("{d}", .{mem.readInt(i64, try exact(8, v), .big)}),
-            // ponytail: doubles become null. Nothing meshkeeper reads is one, and
-            // the float printer's tables cost 18 KB; print them if that changes.
-            .double => if (v.len < 8) return error.Malformed else try w.writeAll("null"),
-            .string => {
-                if (v.len == 0 or v[v.len - 1] != 0) return error.Malformed;
-                try std.json.Stringify.encodeJsonString(mem.sliceTo(v, 0), .{}, w);
-            },
-            .array, .table => |t| try writeList(w, v, t == .array, depth + 1),
+        return .{ .name = e.name, .value = switch (@as(Type, @fromBackingInt(b.id))) {
+            .int8 => .{ .int = @as(i8, @bitCast((try exact(1, v))[0])) },
+            .int16 => .{ .int = mem.readInt(i16, try exact(2, v), .big) },
+            .int32 => .{ .int = mem.readInt(i32, try exact(4, v), .big) },
+            .int64 => .{ .int = mem.readInt(i64, try exact(8, v), .big) },
+            .string => if (v.len == 0 or v[v.len - 1] != 0) return error.Malformed else .{ .string = mem.sliceTo(v, 0) },
+            .array, .table => .{ .list = .{ .rest = v } },
+            .unspec => .other,
+            .double => if (v.len != 8) return error.Malformed else .other,
             _ => return error.Malformed,
-        }
+        } };
     }
-    try w.writeByte(if (array) ']' else '}');
-}
+
+    /// The first member called `name`.
+    pub fn get(l: List, name: []const u8) !?Value {
+        var it = l;
+        while (try it.next()) |m| if (mem.eql(u8, m.name, name)) return m.value;
+        return null;
+    }
+
+    // Typed lookups: null when the member is missing or has another type.
+    pub fn int(l: List, name: []const u8) !?i64 {
+        return if (try l.get(name)) |v| v.asInt() else null;
+    }
+
+    pub fn string(l: List, name: []const u8) !?[]const u8 {
+        return if (try l.get(name)) |v| v.asString() else null;
+    }
+
+    pub fn list(l: List, name: []const u8) !?List {
+        return if (try l.get(name)) |v| v.asList() else null;
+    }
+};
 
 fn exact(comptime n: usize, v: []const u8) !*const [n]u8 {
     return if (v.len == n) v[0..n] else error.Malformed;
@@ -513,14 +545,38 @@ test "encodes arguments byte for byte like ubus call" {
     }
 }
 
-test "decodes replies to the JSON ubus call prints" {
-    for (vectors.cases) |c| {
-        var bytes: [1024]u8 = undefined;
-        var buf: [1024]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
-        try writeList(&w, try std.fmt.hexToBytes(&bytes, c.hex), false, 0);
-        try std.testing.expectEqualStrings(c.json, w.buffered());
-    }
+/// Visits every member below `l`, so the fuzz test reaches every check.
+fn walk(l: List, depth: usize) !usize {
+    if (depth == 16) return error.Malformed;
+    var it = l;
+    var n: usize = 0;
+    while (try it.next()) |m| n += 1 + if (m.value.asList()) |sub| try walk(sub, depth + 1) else 0;
+    return n;
+}
+
+test "reads the replies libubox encodes" {
+    const t = std.testing;
+    var bytes: [1024]u8 = undefined;
+    const one = List{ .rest = try std.fmt.hexToBytes(&bytes, vectors.cases[4].hex) };
+    try t.expectEqual(5000000000, (try one.int("big")).?);
+    try t.expectEqual(-1, (try one.int("neg")).?);
+    try t.expectEqualStrings("y", (try (try one.list("t")).?.string("x")).?);
+    try t.expectEqual(0, try walk((try one.list("e")).?, 0));
+    try t.expectEqual(null, try one.string("big")); // wrong type
+    try t.expectEqual(null, try one.int("missing"));
+
+    var more: [1024]u8 = undefined;
+    const clients = List{ .rest = try std.fmt.hexToBytes(&more, vectors.cases[5].hex) };
+    try t.expectEqual(5745, (try clients.int("freq")).?);
+    const c = (try (try clients.list("clients")).?.list("02:00:00:00:c0:de")).?;
+    try t.expectEqual(-74, (try c.int("signal")).?);
+    try t.expectEqual(1, (try c.int("auth")).?); // a JSON true
+    var caps = (try c.list("extended_capabilities")).?;
+    var k: usize = 0;
+    while (try caps.next()) |m| : (k += 1) if (k == 2) try t.expectEqual(136, m.value.asInt().?);
+    try t.expectEqual(10, k);
+
+    for (vectors.cases) |v| _ = try walk(.{ .rest = try std.fmt.hexToBytes(&bytes, v.hex) }, 0);
 }
 
 test "parses a message and maps its status" {
@@ -545,7 +601,6 @@ test "fuzz: hostile replies never crash the decoder" {
     var prng: std.Random.DefaultPrng = .init(0x0b05);
     const rand = prng.random();
     var bytes: [1024]u8 = undefined;
-    var out: [4096]u8 = undefined;
     for (0..20_000) |i| {
         var len: usize = undefined;
         if (i % 2 == 0) {
@@ -559,8 +614,7 @@ test "fuzz: hostile replies never crash the decoder" {
             for (0..rand.intRangeAtMost(usize, 1, 4)) |_| bytes[rand.uintLessThan(usize, len)] ^= rand.int(u8) | 1;
             len = rand.intRangeAtMost(usize, len / 2, len);
         }
-        var w: Io.Writer = .fixed(&out);
-        writeList(&w, bytes[0..len], rand.boolean(), 0) catch {};
+        _ = walk(.{ .rest = bytes[0..len] }, 0) catch {};
         _ = Message.parse(bytes[0..len]) catch {};
     }
 }
