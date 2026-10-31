@@ -1,8 +1,63 @@
-.venv/
-__pycache__/
-.pytest_cache/
+# Zig
 zig-out/
 .zig-cache/
-HANDOFF.md
+
+# Python (bench tooling)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Bench: downloaded images, VM disks, sockets, run logs
+bench/.cache/
+bench/.run/
+*.qcow2
+*.img
+*.img.gz
+*.elf
+*.vmlinux
+*.trx
+
+# Build and release artifacts
+*.apk
+*.ipk
+*.tar.gz
+*.tar.zst
+*.tar.xz
+dl/
+dist/
+bin/
+
+# Captures and logs (may hold real MACs and SSIDs)
+*.pcap
+*.pcapng
+*.log
+labgrid-*.log
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+*.secret
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local notes and session files
+.claude/
 CLAUDE.md
+HANDOFF.md
 tasks/
+*-local-command-*.txt
