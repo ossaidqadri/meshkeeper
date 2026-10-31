@@ -1,12 +1,17 @@
 # OpenWrt 25.12.6 malta/be (MIPS big-endian, apk arch mips_24kc) in QEMU.
 # Layout follows aparcar/openwrt-tests (Apache-2.0).
 #
-# NIC 1 (eth0, MAC ...:01): user networking, the VM's LAN at 192.168.1.1; ssh is forwarded to 127.0.0.1:2222.
+# NIC 1 (eth0, MAC ...:01): user networking, the VM's LAN at 192.168.1.1; ssh is forwarded to
+#   127.0.0.1:$BENCH_SSH_PORT (default 2222) by the strategy.
 # NIC 2 (eth1, MAC ...:02): unix datagram sockets in /tmp/bench-run, for the fake satellite. The VM
 #   side is bound at vm.sock, frames go to agent.sock. Bridge it into br-lan inside the VM.
 targets:
   main:
-    resources: {}
+    resources:
+      - NetworkService:
+          address: 127.0.0.1  # the strategy sets the forwarded port ($BENCH_SSH_PORT, default 2222)
+          port: 22
+          username: root
     drivers:
       - QEMUDriver:
           qemu_bin: qemu_bin
@@ -17,12 +22,16 @@ targets:
           extra_args: >-
             -netdev dgram,id=sat,local.type=unix,local.path=/tmp/bench-run/vm.sock,remote.type=unix,remote.path=/tmp/bench-run/agent.sock
             -device pcnet,netdev=sat,mac=52:54:00:12:34:02
-          nic: user,model=pcnet,mac=52:54:00:12:34:01,net=192.168.1.0/24,hostfwd=tcp:127.0.0.1:2222-192.168.1.1:22
+          nic: user,model=pcnet,mac=52:54:00:12:34:01,net=192.168.1.0/24,id=lan
       - ShellDriver:
           login_prompt: Please press Enter to activate this console.
           prompt: 'root@[\w()-]+:[^ ]+ '
           await_login_timeout: 60
           username: root
+      - SSHDriver:
+          keyfile: /tmp/bench-run/id_ed25519
+          connection_timeout: 120.0
+          explicit_scp_mode: true
       - OpenWrtStrategy: {}
 tools:
   qemu_bin: qemu-system-mips
