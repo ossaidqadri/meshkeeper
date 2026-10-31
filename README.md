@@ -6,6 +6,17 @@ One static Zig binary with no runtime dependencies beyond OpenWrt.
 
 Background and internals: [why it exists and how it works](docs/design.md), [what we ran into](docs/field-notes.md), [building](docs/building.md).
 
+## Install with an AI assistant
+
+Paste this into an assistant that can run commands on your computer (Claude Code, Codex, Cursor). It checks everything first and asks before each change.
+
+```
+Install https://github.com/ossaidqadri/meshkeeper on my OpenWrt router.
+Follow docs/install-with-ai.md in that repo. Ask me before every change.
+```
+
+AI agents: follow [docs/install-with-ai.md](docs/install-with-ai.md).
+
 ## Tested on
 
 TP-Link Archer C6 v2 (US) on OpenWrt 25.12.6 as the main router, TP-Link Archer AX12 (US) v1 on stock firmware 1.5.1 as the satellite, 5 GHz backhaul. Other EasyMesh satellites might work but haven't been tried. Reports welcome.
