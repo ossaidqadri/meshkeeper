@@ -66,7 +66,7 @@ define Package/meshkeeper
 	TITLE:=EasyMesh controller for stock-firmware mesh satellites
 	URL:=https://github.com/ossaidqadri/meshkeeper
 	MAINTAINER:=Ossaid Quadri <imossaidquadri@gmail.com>
-	# ujail is optional in the init script, but the security model assumes it.
+	# The init script always jails the daemon.
 	# No wpad dependency on purpose: apk refuses to install wpad-mbedtls next
 	# to wpad-basic-mbedtls, so it would break the one-command install on a
 	# stock router. The README has the swap instead.
@@ -80,8 +80,10 @@ define Package/meshkeeper/conffiles
 endef
 
 define Package/meshkeeper/install
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/etc/capabilities $(1)/usr/share/acl.d
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/etc/capabilities $(1)/usr/share/acl.d $(1)/lib/upgrade/keep.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/zig-out/bin/meshkeeper $(1)/usr/sbin/meshkeeper
+	# The learned state is written at runtime, so sysupgrade only keeps it if told to.
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/meshkeeper $(1)/lib/upgrade/keep.d/meshkeeper
 	$(INSTALL_BIN) ./files/etc/init.d/meshkeeper $(1)/etc/init.d/meshkeeper
 	$(INSTALL_CONF) ./files/etc/config/meshkeeper $(1)/etc/config/meshkeeper
 	$(INSTALL_DATA) ./files/etc/capabilities/meshkeeper.json $(1)/etc/capabilities/meshkeeper.json

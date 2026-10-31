@@ -46,7 +46,7 @@ It listens for IEEE 1905 frames on the LAN bridge with a raw socket, answers the
 
 ### 1. Router Wi-Fi
 
-You need the full `wpad-mbedtls` (or another full wpad), not `wpad-basic`, for WPS. Then add a hidden backhaul network on the radio the satellite will connect to, and point your 5 GHz network's WPS at it:
+You need the full `wpad-mbedtls` (or another full wpad), not `wpad-basic`, for WPS: `apk del wpad-basic-mbedtls && apk add wpad-mbedtls`. Then add a hidden backhaul network on the radio the satellite will connect to, and point your 5 GHz network's WPS at it:
 
 ```
 config wifi-iface 'meshbh'
@@ -72,41 +72,23 @@ Generate the SSID and key on the router, e.g. `tr -dc 'A-Za-z0-9' </dev/urandom 
 
 ### 2. Install
 
-From a machine with the binary built (see Building) and this repo:
+Download the apk for your router's CPU from the release page (`apk --print-arch` on the router tells you which) and install it:
 
 ```
-scp -O zig-out/bin/meshkeeper root@192.168.1.1:/usr/sbin/meshkeeper
-scp -O files/etc/config/meshkeeper root@192.168.1.1:/etc/config/meshkeeper
-scp -O files/etc/init.d/meshkeeper root@192.168.1.1:/etc/init.d/meshkeeper
-scp -O files/etc/capabilities/meshkeeper.json root@192.168.1.1:/etc/capabilities/meshkeeper.json
-scp -O files/usr/share/acl.d/meshkeeper.json root@192.168.1.1:/usr/share/acl.d/meshkeeper.json
-ssh root@192.168.1.1 'chmod 755 /usr/sbin/meshkeeper /etc/init.d/meshkeeper && /etc/init.d/meshkeeper enable && /etc/init.d/meshkeeper start'
+apk add --allow-untrusted ./meshkeeper-<version>-<arch>.apk
 ```
 
-To keep it across firmware upgrades, add these to `/etc/sysupgrade.conf`:
-
-```
-/usr/sbin/meshkeeper
-/etc/init.d/meshkeeper
-/etc/rc.d/S99meshkeeper
-/etc/capabilities/meshkeeper.json
-/usr/share/acl.d/meshkeeper.json
-/etc/meshkeeper/
-```
-
-`logread -e meshkeeper` shows what it's doing.
+It creates the `meshkeeper` user, installs the service and starts it. `logread -e meshkeeper` shows what it's doing.
 
 Optional, if you use LuCI: a Status, Mesh page that lists every wireless device, which router it's on and how well that router hears it, refreshed every 5 seconds. Handy while you find a spot for the satellite.
 
 ```
-ssh root@192.168.1.1 'mkdir -p /www/luci-static/resources/view/meshkeeper'
-scp -O files/www/luci-static/resources/view/meshkeeper/mesh.js root@192.168.1.1:/www/luci-static/resources/view/meshkeeper/mesh.js
-scp -O files/usr/share/luci/menu.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/luci/menu.d/luci-app-meshkeeper.json
-scp -O files/usr/share/rpcd/acl.d/luci-app-meshkeeper.json root@192.168.1.1:/usr/share/rpcd/acl.d/luci-app-meshkeeper.json
-ssh root@192.168.1.1 '/etc/init.d/rpcd reload'
+apk add --allow-untrusted ./luci-app-meshkeeper-<version>.apk
 ```
 
-Then log out of LuCI and back in, permissions are read at login. Add those three files to `/etc/sysupgrade.conf` too.
+Then log out of LuCI and back in, permissions are read at login.
+
+A firmware upgrade keeps your config and what meshkeeper has learned, but not the packages, so install the two apks again after one.
 
 ### 3. Pair the satellite once
 
