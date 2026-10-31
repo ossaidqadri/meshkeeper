@@ -314,6 +314,9 @@ pub const Controller = struct {
     agents: [max_agents]Agent = undefined,
     n_agents: u8 = 0,
     next_mid: u16,
+    /// First tick: silence of an agent loaded from state but not heard yet
+    /// counts from here.
+    started: ?Ms = null,
     /// Learned state changed; the caller should persist it.
     dirty: bool = false,
     local_clients: [max_clients]LocalClient = undefined,
@@ -737,10 +740,13 @@ pub const Controller = struct {
 
     /// Periodic work: topology queries, renew requests, the auto-WPS gate and steering.
     pub fn tick(c: *Controller, now: Ms, out: []u8) !Tick {
+        const started = c.started orelse now;
+        c.started = started;
         for (c.agents[0..c.n_agents]) |*a| {
-            if (a.silent(now) and !a.outage.logged) {
+            const heard = a.last_heard orelse started;
+            if (now - heard > timing.agent_silent_after and !a.outage.logged) {
                 a.outage.logged = true;
-                log.warn("agent {x} went silent: nothing heard for {d} s", .{ a.al_mac, @divTrunc(now - (a.last_heard orelse now), std.time.ms_per_s) });
+                log.warn("agent {x} went silent: nothing heard for {d} s", .{ a.al_mac, @divTrunc(now - heard, std.time.ms_per_s) });
             }
             if (c.wpsGate(a, now)) |action| return .{ .wps = action };
             if (a.silent(now)) continue;
@@ -1116,6 +1122,19 @@ test "a silent agent is reported once per outage" {
     try testing.expect(a.outage.logged);
     _ = try c.onFrame(hello, timing.agent_silent_after + 2, &out, testSecrets());
     try testing.expect(!a.outage.logged);
+}
+
+test "an agent loaded from state is reported only after a minute unheard" {
+    var c = testController(false);
+    var out: [cmdu.max_frame]u8 = undefined;
+    c.load("agent 020000a0d950\n");
+    const start = 5 * std.time.ms_per_min; // daemon's monotonic clock isn't 0 at start
+    _ = try c.tick(start, &out);
+    try testing.expect(!c.agent(ax12).?.outage.logged);
+    _ = try c.tick(start + timing.agent_silent_after, &out);
+    try testing.expect(!c.agent(ax12).?.outage.logged);
+    _ = try c.tick(start + timing.agent_silent_after + 1, &out);
+    try testing.expect(c.agent(ax12).?.outage.logged);
 }
 
 test "unanswered topology queries back off" {
