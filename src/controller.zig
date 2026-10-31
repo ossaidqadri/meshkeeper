@@ -216,6 +216,8 @@ pub const Agent = struct {
     beacon_unanswered: u8 = 0,
 
     const Outage = struct {
+        /// "went silent" was logged; "is back" follows when it's heard again.
+        logged: bool = false,
         first_probe: ?Ms = null,
         windows: u8 = 0,
         last_window: ?Ms = null,
@@ -372,7 +374,7 @@ pub const Controller = struct {
             else => false,
         };
         const a = (if (introduces and f.tlv_bytes.len > 0) c.agentOrNew(al_mac) else c.agent(al_mac)) orelse return null;
-        if (a.outage.windows > 0 or a.outage.first_probe != null) log.info("agent {x} is back", .{al_mac});
+        if (a.outage.logged) log.info("agent {x} is back", .{al_mac});
         a.last_heard = now;
         a.outage = .{};
 
@@ -746,6 +748,10 @@ pub const Controller = struct {
     /// Periodic work: topology queries, renew requests, the auto-WPS gate and steering.
     pub fn tick(c: *Controller, now: Ms, out: []u8) !Tick {
         for (c.agents[0..c.n_agents]) |*a| {
+            if (a.silent(now) and !a.outage.logged) {
+                a.outage.logged = true;
+                log.warn("agent {x} went silent: nothing heard for {d} s", .{ a.al_mac, @divTrunc(now - (a.last_heard orelse now), std.time.ms_per_s) });
+            }
             if (c.wpsGate(a, now)) |action| return .{ .wps = action };
             if (a.silent(now)) continue;
             const due = if (a.last_report) |t| now - t > timing.query_interval else true;
@@ -1156,6 +1162,21 @@ test "zero-filled 0x893a frames from a backhaul STA create no agent" {
     const f: cmdu.Frame = try .parse(&frame);
     try testing.expectEqual(null, try c.onFrame(f, 0, &out, testSecrets()));
     try testing.expectEqual(0, c.n_agents);
+}
+
+test "a silent agent is reported once per outage" {
+    var c = testController(false);
+    var in: [cmdu.max_frame]u8 = undefined;
+    var out: [cmdu.max_frame]u8 = undefined;
+    const hello = try frameFrom(&in, .topology_query, &.{.{ .type = .al_mac, .value = &ax12 }});
+    _ = try c.onFrame(hello, 0, &out, testSecrets());
+    const a = c.agent(ax12).?;
+    _ = try c.tick(timing.agent_silent_after, &out);
+    try testing.expect(!a.outage.logged);
+    _ = try c.tick(timing.agent_silent_after + 1, &out);
+    try testing.expect(a.outage.logged);
+    _ = try c.onFrame(hello, timing.agent_silent_after + 2, &out, testSecrets());
+    try testing.expect(!a.outage.logged);
 }
 
 test "unanswered topology queries back off" {
