@@ -1,0 +1,2 @@
+# The Containerfile copies nothing; keep the cached images out of the build context.
+*

@@ -95,6 +95,104 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
+      # The bench's upgrade tests need the same package as release 2, with a different binary.
+      # The SDK is already built here, so rebuild in place; no second SDK anywhere. Uploaded
+      # under another name so the release job, which takes only meshkeeper-*, never ships it.
+      - name: Build release 2 for the bench
+        if: matrix.name == 'mips_24kc' || matrix.name == 'x86_64'
+        run: sh bench/make-r2.sh "$PWD/sdk"
+
+      - name: Collect release 2
+        if: matrix.name == 'mips_24kc' || matrix.name == 'x86_64'
+        env:
+          ARCH: ${{ matrix.name }}
+        run: |
+          mkdir -p out-r2
+          find sdk/bin/packages -name 'meshkeeper-*-r2.apk' |
+          while read -r f; do
+            cp "$f" "out-r2/$(basename "$f" .apk)-$ARCH.apk"
+          done
+          ls -l out-r2
+
+      - uses: actions/upload-artifact@v7
+        if: matrix.name == 'mips_24kc' || matrix.name == 'x86_64'
+        with:
+          name: bench-r2-${{ matrix.name }}
+          path: out-r2/*.apk
+          if-no-files-found: error
+
+  # The real apks on OpenWrt in QEMU (bench/): malta (mips_24kc, the C6's package) for install,
+  # jail, pairing with a fake satellite and the upgrade restart; x86-64 for sysupgrade, which
+  # malta has no image for. x86 uses KVM when the runner has it.
+  bench:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: malta, arch: mips_24kc, env: qemu-malta-be.yaml, fetch: fetch.sh}
+          - {name: x86-64, arch: x86_64, env: qemu-x86-64.yaml, fetch: fetch-x86.sh}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The LuCI apk is architecture independent and ships only in the x86_64 artifact.
+      - uses: actions/download-artifact@v8
+        with:
+          name: meshkeeper-${{ matrix.arch }}
+          path: apks
+      - uses: actions/download-artifact@v8
+        with:
+          name: bench-r2-${{ matrix.arch }}
+          path: apks
+      - uses: actions/download-artifact@v8
+        if: matrix.arch != 'x86_64'
+        with:
+          name: meshkeeper-x86_64
+          path: apks-luci
+      - run: ls -l apks apks-luci 2>/dev/null || ls -l apks
+
+      - uses: actions/cache@v6
+        with:
+          path: bench/.cache
+          key: bench-images-${{ matrix.name }}-${{ hashFiles('bench/fetch.sh', 'bench/fetch-x86.sh') }}
+
+      - name: Let the container use KVM
+        if: matrix.name == 'x86-64'
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+            echo "KVM_FLAG=--device /dev/kvm" >> "$GITHUB_ENV"
+          else
+            echo "no /dev/kvm on this runner: x86 runs under TCG"
+          fi
+
+      - run: docker build -t meshkeeper-bench -f bench/Containerfile bench
+
+      - name: Run the bench
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET_ENV: ${{ matrix.env }}
+          FETCH: ${{ matrix.fetch }}
+        run: |
+          luci_dir=apks; [ -d apks-luci ] && luci_dir=apks-luci
+          # shellcheck disable=SC2086  # KVM_FLAG is "--device /dev/kvm" or empty
+          docker run --rm ${KVM_FLAG:-} \
+            -e ARCH -e TARGET_ENV -e FETCH \
+            -v "$PWD:/repo" -v "$PWD/apks:/apks:ro" -v "$PWD/$luci_dir:/luci:ro" \
+            meshkeeper-bench sh -c '
+              set -eu
+              sh "./$FETCH"
+              uv sync --frozen -q
+              exec uv run pytest --lg-env "targets/$TARGET_ENV" tests -v --tb=short \
+                --meshkeeper-apk "$(ls /apks/meshkeeper-*-r1-$ARCH.apk)" \
+                --meshkeeper-apk-r2 "$(ls /apks/meshkeeper-*-r2-$ARCH.apk)" \
+                --luci-apk "$(ls /luci/luci-app-meshkeeper-*.apk)"
+            '
+
   release:
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
@@ -106,6 +204,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: meshkeeper-*  # not bench-r2-*, the upgrade-test builds
           merge-multiple: true
 
       # A tag that disagrees with build.zig.zon would publish a package whose

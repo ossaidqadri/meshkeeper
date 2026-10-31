@@ -14,6 +14,8 @@ targets:
           machine: pc
           cpu: qemu64
           memory: 512M
+          # KVM when the host has /dev/kvm (CI passes it in), TCG otherwise.
+          extra_args: -accel kvm -accel tcg
           disk: disk
           nic: user,model=virtio-net-pci,mac=52:54:00:12:34:01,net=192.168.1.0/24,id=lan
       - ShellDriver:

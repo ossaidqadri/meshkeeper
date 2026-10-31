@@ -6,9 +6,8 @@
 #   podman run --rm -v $PWD/src:/src:ro -v $PWD/out:/out -v $PWD/bench/build-apks.sh:/b.sh:ro \
 #       debian:bookworm sh /b.sh ath79/generic
 #
-# r2 exists for the upgrade test. Its binary must differ from r1's, or procd (which restarts on the
-# binary's checksum) rightly does nothing. The difference is a sed on one usage string in the
-# container's copy of the sources; /src and the repo are never touched.
+# r2 exists for the upgrade test; make-r2.sh explains how it differs from r1 (a sed on the
+# container's copy of the sources; /src and the repo are never touched). CI runs the same script.
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -38,10 +37,6 @@ make package/meshkeeper/compile V=s > /out/build.log 2>&1 || { tail -60 /out/bui
 find bin/packages -name '*.apk'
 cp $(find bin/packages -name '*.apk') /out/
 
-sed -i 's/^PKG_RELEASE:=1$/PKG_RELEASE:=2/' $pkg/Makefile
-sed -i 's/(default: meshkeeper)/(default: meshkeeper, r2)/' $pkg/src/main.zig
-grep -q 'PKG_RELEASE:=2' $pkg/Makefile && grep -q 'meshkeeper, r2' $pkg/src/main.zig
-make package/meshkeeper/clean V=s > /out/clean-r2.log 2>&1
-make package/meshkeeper/compile V=s > /out/build-r2.log 2>&1 || { tail -60 /out/build-r2.log; exit 1; }
+sh /src/bench/make-r2.sh /build/sdk > /out/build-r2.log 2>&1 || { tail -60 /out/build-r2.log; exit 1; }
 find bin/packages -name '*r2.apk'
 cp $(find bin/packages -name '*r2.apk') /out/
