@@ -9,11 +9,12 @@ MESH_DIR=/var/run/meshkeeper
 
 start_service() {
 	# Unprivileged account; the ubus ACL in /usr/share/acl.d grants it only the calls it makes.
-	# ubusd resolves ACL user names when it loads them, so a new user needs a reload.
-	user_exists meshkeeper || {
+	user_exists meshkeeper ||
 		user_add meshkeeper "" "$(group_add_next meshkeeper)" meshkeeper "$STATE_DIR"
-		kill -HUP "$(pidof ubusd)"
-	}
+	# ubusd resolves ACL user names only when it loads them. The package creates
+	# the user before this first start, so "just created" can't be detected here;
+	# reloading is cheap and harmless when nothing changed.
+	pidof ubusd >/dev/null && kill -HUP $(pidof ubusd)
 	mkdir -p "$STATE_DIR" "$MESH_DIR"
 	chown -R meshkeeper:meshkeeper "$STATE_DIR" "$MESH_DIR"
 

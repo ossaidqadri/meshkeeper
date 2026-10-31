@@ -1,0 +1,133 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The daemon's own tests. Same pinned Zig as the package build.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -fsSLO https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  zig-x86_64-linux-0.17.0.tar.xz" | sha256sum -c -
+          tar -xf zig-x86_64-linux-0.17.0.tar.xz
+          echo "${{ github.workspace }}/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+      - run: zig build test
+
+  # Every arch on a tag; the real router plus the smoke-test arch on a PR.
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          all='[{"name":"mips_24kc","target":"ath79/generic"},
+                {"name":"mipsel_24kc","target":"ramips/mt7621"},
+                {"name":"arm_cortex-a7_neon-vfpv4","target":"ipq40xx/generic"},
+                {"name":"aarch64_cortex-a53","target":"mediatek/filogic"},
+                {"name":"x86_64","target":"x86/64"}]'
+          some='[{"name":"mips_24kc","target":"ath79/generic"},
+                 {"name":"x86_64","target":"x86/64"}]'
+          if [ "$IS_TAG" = "true" ]; then
+            echo "matrix=$all" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$some" >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    needs: [test, targets]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The SDK's prerequisite check refuses to run without these.
+      - name: SDK host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential gawk gettext libncurses-dev libssl-dev zlib1g-dev xz-utils \
+            wget file zstd rsync unzip bzip2 python3 python3-setuptools swig
+
+      - name: Fetch SDK
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          base="https://downloads.openwrt.org/releases/25.12.6/targets/$TARGET"
+          curl -fsSL -o sums "$base/sha256sums"
+          # Name and checksum both come from the release: ipq40xx is published
+          # as _musl_eabi, so the filename cannot be assembled by hand.
+          grep 'openwrt-sdk-.*\.tar\.zst$' sums > sdk.sum
+          file=$(awk '{print $2}' sdk.sum); file=${file#\*}
+          curl -fsSL -o sdk.tar.zst "$base/$file"
+          sha256sum -c sdk.sum
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Build packages
+        run: |
+          mkdir -p sdk/package/meshkeeper
+          cp -r Makefile files src build.zig build.zig.zon LICENSE sdk/package/meshkeeper/
+          cd sdk
+          make defconfig
+          # One package directory, so one target builds both packages.
+          make package/meshkeeper/compile V=s
+
+      - name: Collect
+        env:
+          ARCH: ${{ matrix.name }}
+        run: |
+          mkdir -p out
+          find sdk/bin/packages \( -name 'meshkeeper-*.apk' -o -name 'luci-app-meshkeeper-*.apk' \) |
+          while read -r f; do
+            name=$(basename "$f" .apk)
+            # The LuCI page is architecture independent, so one leg ships it.
+            case "$name" in luci-app-*) [ "$ARCH" = x86_64 ] || continue ;; esac
+            cp "$f" "out/$name-$ARCH.apk"
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshkeeper-${{ matrix.name }}
+          path: out/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A tag that disagrees with build.zig.zon would publish a package whose
+      # version nobody can find again.
+      - name: Tag matches build.zig.zon
+        run: |
+          v=$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || {
+            echo "tag $GITHUB_REF_NAME does not match version $v in build.zig.zon"
+            exit 1
+          }
+
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag dist/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
