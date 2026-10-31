@@ -94,9 +94,11 @@ jobs:
           find sdk/bin/packages \( -name 'meshkeeper-*.apk' -o -name 'luci-app-meshkeeper-*.apk' \) |
           while read -r f; do
             name=$(basename "$f" .apk)
-            # The LuCI page is architecture independent, so one leg ships it.
-            case "$name" in luci-app-*) [ "$ARCH" = x86_64 ] || continue ;; esac
-            cp "$f" "out/$name-$ARCH.apk"
+            # The LuCI page is architecture independent: one leg ships it, unsuffixed.
+            case "$name" in
+              luci-app-*) [ "$ARCH" = x86_64 ] && cp "$f" "out/$name.apk" ;;
+              *) cp "$f" "out/$name-$ARCH.apk" ;;
+            esac
           done
           ls -l out
 
