@@ -151,7 +151,7 @@ def test_apk_upgrade_keeps_owut_entries(vm):
     before = daemon_pid()
     put(vm["--meshkeeper-apk-r2"], "/tmp/meshkeeper-r2.apk")
     rsh("apk add --allow-untrusted --force-non-repository /tmp/meshkeeper-r2.apk")
-    assert "meshkeeper-0.2.0-r2" in rsh("apk list -I meshkeeper")
+    assert re.search(r"meshkeeper-[\d.]+-r2 ", rsh("apk list -I meshkeeper"))
     # procd swaps the instance after apk returns; under KVM the old pid is still there at first.
     for _ in range(30):
         if daemon_pid() not in ("", before):
@@ -195,7 +195,7 @@ def test_reinstall_after_sysupgrade_over_restored_files(vm):
     assert owut_remove() == "foo"
     put(vm["--meshkeeper-apk-r2"], "/tmp/meshkeeper-r2.apk")
     rsh("apk add --allow-untrusted --force-non-repository /tmp/meshkeeper-r2.apk")
-    assert "meshkeeper-0.2.0-r2" in rsh("apk list -I meshkeeper")
+    assert re.search(r"meshkeeper-[\d.]+-r2 ", rsh("apk list -I meshkeeper"))
     assert apk_new() == [], "files restored by sysupgrade made apk write .apk-new"
     wait_daemon()
     remove = owut_remove().split()

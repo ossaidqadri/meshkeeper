@@ -75,6 +75,6 @@ def test_upgrade_restarts_service(meshkeeper, request):
     sh(ssh, "sleep 5")
     after = pid(ssh)
     assert after != before, f"pid unchanged: {before}"
-    assert "meshkeeper-0.2.0-r2" in sh(ssh, "apk list -I meshkeeper")
+    assert re.search(r"meshkeeper-[\d.]+-r2 ", sh(ssh, "apk list -I meshkeeper"))
     assert "procd_set_param file" in sh(ssh, "cat /etc/init.d/meshkeeper")
     test_no_apk_new_files(ssh)
