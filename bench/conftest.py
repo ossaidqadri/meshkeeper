@@ -5,6 +5,7 @@ def pytest_addoption(parser):
     parser.addoption("--meshkeeper-apk", help="meshkeeper apk to install (built for the target's package arch)")
     parser.addoption("--luci-apk", help="luci-app-meshkeeper apk to install")
     parser.addoption("--meshkeeper-apk-r2", help="same package with a bumped release, for the upgrade tests")
+    parser.addoption("--meshkeeper-bin", help="a binary to run in place of the package's (quick.sh)")
 
 
 def pytest_collection_modifyitems(config, items):

@@ -91,6 +91,12 @@ def meshkeeper(router, ssh, request):
     ssh.put(luci, "/tmp/luci-app-meshkeeper.apk")
     # --force-non-repository: the initramfs root is RAM, apk warns the package is lost on reboot.
     sh(ssh, "apk add --allow-untrusted --force-non-repository /tmp/meshkeeper.apk /tmp/luci-app-meshkeeper.apk")
+    # Quick loop: the package as released, running a binary just built on the laptop.
+    binary = request.config.getoption("--meshkeeper-bin")
+    if binary:
+        # The installed one is already running ("Text file busy"); a rename replaces it anyway.
+        ssh.put(binary, "/tmp/meshkeeper.bin")
+        sh(ssh, "chmod 755 /tmp/meshkeeper.bin && mv /tmp/meshkeeper.bin /usr/sbin/meshkeeper")
     for line in MESHKEEPER_CONFIG.strip().split("\n")[1:]:
         sh(ssh, line)
     sh(ssh, "/etc/init.d/meshkeeper restart; sleep 8")
