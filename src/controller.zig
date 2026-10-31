@@ -787,40 +787,28 @@ pub const Controller = struct {
 
     /// Live mesh view for the status page: each agent, whether it is talking,
     /// and its clients with the signal the agent hears from them.
+    /// Written by hand: every value is a number, a bool or a MAC, so nothing
+    /// needs escaping, and std.json's writer would cost 18 KB of binary.
     pub fn writeMesh(c: *const Controller, w: *std.Io.Writer, now: Ms) std.Io.Writer.Error!void {
-        var s: std.json.Stringify = .{ .writer = w };
-        try s.beginObject();
-        try s.objectField("agents");
-        try s.beginArray();
-        for (c.agents[0..c.n_agents]) |a| {
-            try s.beginObject();
-            try s.objectField("mac");
-            try s.write(macText(a.al_mac));
-            try s.objectField("online");
-            try s.write(!a.silent(now));
-            try s.objectField("heard_s_ago");
-            try s.write(secondsAgo(a.last_heard, now));
-            try s.objectField("steering");
-            try s.write(if (a.caps) |caps| caps.agent_rssi_steering else null);
-            try s.objectField("ifaces");
-            try s.beginArray();
-            for (a.ifaces[0..a.n_ifaces]) |m| try s.write(macText(m));
-            try s.endArray();
-            try s.objectField("clients");
-            try s.beginArray();
-            for (a.clients[0..a.n_clients]) |cl| try s.write(.{
-                .mac = macText(cl.mac),
-                .bssid = macText(cl.bssid),
-                .rssi = cl.rssi,
-                .down_mbps = cl.downlink_mbps,
-                .up_mbps = cl.uplink_mbps,
-                .metrics_s_ago = secondsAgo(cl.metrics_at, now),
+        try w.writeAll("{\"agents\":[");
+        for (c.agents[0..c.n_agents], 0..) |a, i| {
+            if (i > 0) try w.writeByte(',');
+            const steering: ?bool = if (a.caps) |caps| caps.agent_rssi_steering else null;
+            try w.print("{{\"mac\":\"{s}\",\"online\":{s},\"heard_s_ago\":{?d},\"steering\":{s},\"ifaces\":[", .{
+                &macText(a.al_mac),
+                if (a.silent(now)) "false" else "true",
+                secondsAgo(a.last_heard, now),
+                if (steering) |s| (if (s) "true" else "false") else "null",
             });
-            try s.endArray();
-            try s.endObject();
+            for (a.ifaces[0..a.n_ifaces], 0..) |m, k| try w.print("{s}\"{s}\"", .{ if (k > 0) "," else "", &macText(m) });
+            try w.writeAll("],\"clients\":[");
+            for (a.clients[0..a.n_clients], 0..) |cl, k| try w.print(
+                "{s}{{\"mac\":\"{s}\",\"bssid\":\"{s}\",\"rssi\":{?d},\"down_mbps\":{d},\"up_mbps\":{d},\"metrics_s_ago\":{?d}}}",
+                .{ if (k > 0) "," else "", &macText(cl.mac), &macText(cl.bssid), cl.rssi, cl.downlink_mbps, cl.uplink_mbps, secondsAgo(cl.metrics_at, now) },
+            );
+            try w.writeAll("]}");
         }
-        try s.endArray();
-        try s.endObject();
+        try w.writeAll("]}");
     }
 
     /// Persists what was learned (agents, their interfaces, radio bands and
