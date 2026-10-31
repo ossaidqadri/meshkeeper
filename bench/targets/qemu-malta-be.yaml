@@ -1,0 +1,32 @@
+# OpenWrt 25.12.6 malta/be (MIPS big-endian, apk arch mips_24kc) in QEMU.
+# Layout follows aparcar/openwrt-tests (Apache-2.0).
+#
+# NIC 1 (eth0, MAC ...:01): user networking, the VM's LAN at 192.168.1.1; ssh is forwarded to 127.0.0.1:2222.
+# NIC 2 (eth1, MAC ...:02): unix datagram sockets in /tmp/bench-run, for the fake satellite. The VM
+#   side is bound at vm.sock, frames go to agent.sock. Bridge it into br-lan inside the VM.
+targets:
+  main:
+    resources: {}
+    drivers:
+      - QEMUDriver:
+          qemu_bin: qemu_bin
+          machine: malta
+          cpu: 24Kc
+          memory: 256M
+          kernel: kernel
+          extra_args: >-
+            -netdev dgram,id=sat,local.type=unix,local.path=/tmp/bench-run/vm.sock,remote.type=unix,remote.path=/tmp/bench-run/agent.sock
+            -device pcnet,netdev=sat,mac=52:54:00:12:34:02
+          nic: user,model=pcnet,mac=52:54:00:12:34:01,net=192.168.1.0/24,hostfwd=tcp:127.0.0.1:2222-192.168.1.1:22
+      - ShellDriver:
+          login_prompt: Please press Enter to activate this console.
+          prompt: 'root@[\w()-]+:[^ ]+ '
+          await_login_timeout: 60
+          username: root
+      - OpenWrtStrategy: {}
+tools:
+  qemu_bin: qemu-system-mips
+images:
+  kernel: ../.cache/openwrt-25.12.6-malta-be-vmlinux-initramfs.elf
+imports:
+  - ../strategies/openwrt.py

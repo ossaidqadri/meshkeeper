@@ -1,0 +1,9 @@
+.cache/
+.run/
+.venv/
+__pycache__/
+*.pcap
+*.log
+*.apk
+*.img
+*.img.gz
