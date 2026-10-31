@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Zig
         run: |
           curl -fsSLO https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
@@ -39,7 +39,7 @@ jobs:
             {"name":"mips_24kc","target":"ath79/generic"},
             {"name":"x86_64","target":"x86/64"}]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The SDK's prerequisite check refuses to run without these.
       - name: SDK host tools
@@ -59,10 +59,10 @@ jobs:
           # as _musl_eabi, so the filename cannot be assembled by hand.
           grep 'openwrt-sdk-.*\.tar\.zst$' sums > sdk.sum
           file=$(awk '{print $2}' sdk.sum); file=${file#\*}
-          curl -fsSL -o sdk.tar.zst "$base/$file"
+          curl -fsSL -o "$file" "$base/$file"
           sha256sum -c sdk.sum
           mkdir sdk
-          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          tar --zstd -xf "$file" -C sdk --strip-components=1
 
       - name: Build packages
         run: |
@@ -89,7 +89,7 @@ jobs:
           done
           ls -l out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: meshkeeper-${{ matrix.name }}
           path: out/*.apk
@@ -102,8 +102,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
