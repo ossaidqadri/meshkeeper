@@ -28,12 +28,14 @@ pub const MsgType = enum(u16) {
     ack = 0x8000,
     ap_capability_query = 0x8001,
     ap_capability_report = 0x8002,
+    multi_ap_policy_config_request = 0x8003,
     assoc_sta_link_metrics_query = 0x800D,
     assoc_sta_link_metrics_response = 0x800E,
     beacon_metrics_query = 0x8011,
     beacon_metrics_response = 0x8012,
     client_steering_request = 0x8014,
     client_steering_btm_report = 0x8015,
+    client_association_control_request = 0x8016,
     steering_completed = 0x8017,
     _,
 
@@ -65,6 +67,7 @@ pub const Tlv = enum(u8) {
     ap_operational_bss = 0x83,
     associated_clients = 0x84,
     ap_radio_basic_caps = 0x85,
+    steering_policy = 0x89,
     client_association_event = 0x92,
     sta_mac_address = 0x95,
     associated_sta_link_metrics = 0x96,
@@ -72,6 +75,7 @@ pub const Tlv = enum(u8) {
     beacon_metrics_response = 0x9A,
     steering_request = 0x9B,
     steering_btm_report = 0x9C,
+    client_association_control_request = 0x9D,
     ap_capability = 0xA1,
     error_code = 0xA3,
     multi_ap_profile = 0xB3,
@@ -334,6 +338,45 @@ pub fn steeringRequest(serving: Mac, sta: Mac, target: SteerTarget) [27]u8 {
     return v;
 }
 
+pub const SteeringPolicy = enum(u8) { disallowed = 0, mandated = 1, allowed = 2 };
+
+/// dBm to RCPI (802.11), the inverse of `rcpiToDbm`.
+pub fn dbmToRcpi(dbm: i8) u8 {
+    return @intCast((@as(i16, dbm) + 110) * 2);
+}
+
+/// Steering Policy TLV value (EasyMesh 17.2.11, layout as in prplMesh tlvf):
+/// no disallowed clients, then for each radio its agent-initiated steering
+/// policy, channel utilization threshold 0 (unused), and RCPI threshold.
+/// `out` must hold 3 + 9 * radios.len bytes; returns the filled part.
+pub fn steeringPolicy(out: []u8, radios: []const Mac, policy: SteeringPolicy, threshold_dbm: i8) []u8 {
+    out[0] = 0; // local steering disallowed STAs
+    out[1] = 0; // BTM steering disallowed STAs
+    out[2] = @intCast(radios.len);
+    var n: usize = 3;
+    for (radios) |ruid| {
+        out[n..][0..6].* = ruid;
+        out[n + 6] = @backingInt(policy);
+        out[n + 7] = 0; // channel utilization threshold, unused
+        out[n + 8] = dbmToRcpi(threshold_dbm);
+        n += 9;
+    }
+    return out[0..n];
+}
+
+/// Client Association Control Request TLV value (EasyMesh 17.2.31): block
+/// `sta` from `bssid` for `seconds` (0x00 = block; the agent unblocks after
+/// the validity period), or unblock it (0x01, period ignored).
+pub fn associationControl(bssid: Mac, sta: Mac, block: bool, seconds: u16) [16]u8 {
+    var v: [16]u8 = undefined;
+    v[0..6].* = bssid;
+    v[6] = if (block) 0x00 else 0x01;
+    mem.writeInt(u16, v[7..9], seconds, .big);
+    v[9] = 1;
+    v[10..16].* = sta;
+    return v;
+}
+
 /// Steering BTM Report TLV: the client's answer to a BTM request (0 = accept).
 pub const BtmReport = struct {
     bssid: Mac,
@@ -433,6 +476,17 @@ test "beacon query and report" {
 test "steering request layout" {
     const v = steeringRequest(.{ 1, 1, 1, 1, 1, 1 }, .{ 2, 2, 2, 2, 2, 2 }, .{ .bssid = .{ 3, 3, 3, 3, 3, 3 }, .op_class = 128, .channel = 149 });
     try testing.expectEqualSlices(u8, &([_]u8{ 1, 1, 1, 1, 1, 1, 0xa0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 1, 3, 3, 3, 3, 3, 3, 128, 149 }), &v);
+}
+
+test "steering policy and association control layout" {
+    var out: [3 + 9 * 2]u8 = undefined;
+    const radios = [_]Mac{ @splat(1), @splat(2) };
+    try testing.expectEqualSlices(u8, &([_]u8{ 0, 0, 2 } ++ @as([6]u8, @splat(1)) ++ [_]u8{ 2, 0, 90 } ++ @as([6]u8, @splat(2)) ++ [_]u8{ 2, 0, 90 }), steeringPolicy(&out, &radios, .allowed, -65));
+    const ac = associationControl(@splat(3), @splat(4), true, 30);
+    try testing.expectEqualSlices(u8, &(@as([6]u8, @splat(3)) ++ [_]u8{ 0, 0, 30, 1 } ++ @as([6]u8, @splat(4))), &ac);
+    try testing.expectEqual(@as(u8, 0), dbmToRcpi(-110));
+    try testing.expectEqual(@as(u8, 100), dbmToRcpi(-60));
+    try testing.expectEqual(@as(?i8, -72), rcpiToDbm(dbmToRcpi(-72)));
 }
 
 test "associated clients and link metrics walks" {

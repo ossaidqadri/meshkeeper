@@ -81,11 +81,17 @@ fn syslogLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comp
 const usage =
     \\usage: meshkeeper [--observe] [--config NAME]
     \\       meshkeeper [--config NAME] --steer AGENT CLIENT FROM TO
+    \\       meshkeeper [--config NAME] --policy AGENT off|mandate|allow DBM RUID...
+    \\       meshkeeper [--config NAME] --block AGENT BSSID CLIENT SECONDS
     \\  --observe      decode and log, never send frames or open WPS
     \\  --config NAME  UCI config to read (default: meshkeeper)
     \\  --steer        ask agent AGENT to move CLIENT from its BSS FROM to this
     \\                 router's BSS TO, once, then exit; the running daemon logs
     \\                 the answer (MACs as on the Mesh page)
+    \\  --policy       set AGENT's own steering for the listed radios: off, or move
+    \\                 clients weaker than DBM by itself (mandate) or when it likes (allow)
+    \\  --block        keep CLIENT off AGENT's BSS for SECONDS (0 unblocks), so it
+    \\                 reconnects elsewhere; disconnects the client
     \\
 ;
 
@@ -129,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
 
     var observe = false;
     var steer: ?[]const []const u8 = null;
+    var policy: ?[]const []const u8 = null;
+    var block: ?[]const []const u8 = null;
     var config_name: []const u8 = "meshkeeper";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -137,6 +145,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--steer") and i + 4 < args.len) {
             steer = args[i + 1 .. i + 5];
             i += 4;
+        } else if (std.mem.eql(u8, args[i], "--block") and i + 4 < args.len) {
+            block = args[i + 1 .. i + 5];
+            i += 4;
+        } else if (std.mem.eql(u8, args[i], "--policy") and i + 4 < args.len) {
+            policy = args[i + 1 ..]; // the RUIDs take the rest
+            i = args.len;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len and std.mem.indexOfScalar(u8, args[i + 1], '/') == null) {
             i += 1;
             config_name = args[i];
@@ -156,6 +170,8 @@ pub fn main(init: std.process.Init) !void {
     const sock = try PacketSocket.open(io, settings.interface);
     defer sock.close();
     if (steer) |s| return steerOnce(io, sock, settings, s);
+    if (policy) |p| return policyOnce(io, sock, p);
+    if (block) |b| return blockOnce(io, sock, b);
 
     var first_mid: u16 = undefined;
     io.random(std.mem.asBytes(&first_mid));
@@ -412,10 +428,7 @@ fn parseEvent(n: ubus.Subscriber.Notification) !?Event {
 /// for a weak signal. prplMesh certifies steering the same way.
 fn steerOnce(io: Io, sock: PacketSocket, s: Settings, args: []const []const u8) !void {
     var macs: [4]cmdu.Mac = undefined;
-    for (args, &macs) |text, *m| m.* = parseMacText(text) orelse {
-        std.debug.print("not a MAC: {s}\n{s}", .{ text, usage });
-        std.process.exit(2);
-    };
+    for (args, &macs) |text, *m| m.* = macOrExit(text);
     const agent, const sta, const from, const to = macs;
     const local = for (s.local) |l| (if (std.mem.eql(u8, &l.bssid, &to)) break l) else {
         std.debug.print("{s} is not one of this router's BSSes\n", .{args[3]});
@@ -429,6 +442,71 @@ fn steerOnce(io: Io, sock: PacketSocket, s: Settings, args: []const []const u8) 
         .{ .type = .steering_request, .value = &req },
     }));
     log.info("asked agent {x} to move {x} to {x} (mid {d})", .{ agent, sta, to, mid });
+}
+
+/// `--policy`: one Multi-AP Policy Config Request, setting the agent's own
+/// steering for the listed radios.
+fn policyOnce(io: Io, sock: PacketSocket, args: []const []const u8) !void {
+    const agent = macOrExit(args[0]);
+    const policy: cmdu.SteeringPolicy = if (std.mem.eql(u8, args[1], "off"))
+        .disallowed
+    else if (std.mem.eql(u8, args[1], "mandate"))
+        .mandated
+    else if (std.mem.eql(u8, args[1], "allow"))
+        .allowed
+    else {
+        std.debug.print("mode is off, mandate or allow, not {s}\n{s}", .{ args[1], usage });
+        std.process.exit(2);
+    };
+    const dbm = std.fmt.parseInt(i8, args[2], 10) catch dbmOutOfRange(args[2]);
+    if (dbm > 0 or dbm < -110) dbmOutOfRange(args[2]);
+    const ruid_args = args[3..];
+    if (ruid_args.len > controller.max_radios) {
+        std.debug.print("at most {d} RUIDs\n{s}", .{ controller.max_radios, usage });
+        std.process.exit(2);
+    }
+    var ruids: [controller.max_radios]cmdu.Mac = undefined;
+    for (ruid_args, ruids[0..ruid_args.len]) |text, *m| m.* = macOrExit(text);
+    var value: [3 + 9 * controller.max_radios]u8 = undefined;
+    const tlv = cmdu.steeringPolicy(&value, ruids[0..ruid_args.len], policy, dbm);
+    var mid: u16 = undefined;
+    io.random(std.mem.asBytes(&mid));
+    var tx: [cmdu.max_frame]u8 = undefined;
+    try sock.send(try cmdu.build(&tx, agent, sock.mac, .multi_ap_policy_config_request, mid, &.{
+        .{ .type = .steering_policy, .value = tlv },
+    }));
+    log.info("sent steering policy {s} at {d} dBm for {d} radio(s) to agent {x} (mid {d})", .{ args[1], dbm, ruid_args.len, agent, mid });
+}
+
+/// `--block`: one Client Association Control Request, keeping a client off a BSS.
+fn blockOnce(io: Io, sock: PacketSocket, args: []const []const u8) !void {
+    const agent = macOrExit(args[0]);
+    const bssid = macOrExit(args[1]);
+    const sta = macOrExit(args[2]);
+    const seconds = std.fmt.parseInt(u16, args[3], 10) catch {
+        std.debug.print("not seconds (0-65535): {s}\n{s}", .{ args[3], usage });
+        std.process.exit(2);
+    };
+    const value = cmdu.associationControl(bssid, sta, seconds != 0, seconds);
+    var mid: u16 = undefined;
+    io.random(std.mem.asBytes(&mid));
+    var tx: [cmdu.max_frame]u8 = undefined;
+    try sock.send(try cmdu.build(&tx, agent, sock.mac, .client_association_control_request, mid, &.{
+        .{ .type = .client_association_control_request, .value = &value },
+    }));
+    log.info("asked agent {x} to block {x} from {x} for {d} s, 0 = unblock (mid {d})", .{ agent, sta, bssid, seconds, mid });
+}
+
+fn macOrExit(text: []const u8) cmdu.Mac {
+    return parseMacText(text) orelse {
+        std.debug.print("not a MAC: {s}\n{s}", .{ text, usage });
+        std.process.exit(2);
+    };
+}
+
+fn dbmOutOfRange(text: []const u8) noreturn {
+    std.debug.print("DBM is between -110 and 0, not {s}\n{s}", .{ text, usage });
+    std.process.exit(2);
 }
 
 /// "aa:bb:cc:dd:ee:ff", either case.
