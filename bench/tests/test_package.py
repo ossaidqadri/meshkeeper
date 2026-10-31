@@ -6,8 +6,8 @@ import pytest
 
 from conftest import sh
 
-# Measured 1308 kB (RssAnon 424 kB) on 0.2.0 in the emulator, plus ~10% headroom; tighten after the footprint work.
-RSS_LIMIT_KB = 1450
+# Measured 908 kB (RssAnon 152 kB) in the emulator after reading ubus replies in place, plus ~10% headroom.
+RSS_LIMIT_KB = 1000
 
 
 def pid(ssh):
