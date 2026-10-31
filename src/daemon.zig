@@ -216,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
                 const f = cmdu.Frame.parse(frame) catch continue;
                 const secrets = try wsc.Secrets.random(io);
                 const reply = ctl.onFrame(f, now, &tx, secrets) catch |err| {
-                    log.warn("frame {t} from {x}: {t}", .{ f.msg_type, f.src, err });
+                    log.warn("frame {f} from {x}: {t}", .{ f.msg_type, f.src, err });
                     continue;
                 };
                 if (reply) |r| send(sock, observe, r);
@@ -278,10 +278,10 @@ fn writeMesh(io: Io, ctl: *const Controller, now: i64) !void {
 fn send(sock: PacketSocket, observe: bool, frame: []const u8) void {
     const f = cmdu.Frame.parse(frame) catch unreachable; // built by us
     if (observe) {
-        log.info("observe: would send {t} to {x}", .{ f.msg_type, f.dst });
+        log.info("observe: would send {f} to {x}", .{ f.msg_type, f.dst });
         return;
     }
-    sock.send(frame) catch |err| log.warn("send {t} to {x}: {t}", .{ f.msg_type, f.dst, err });
+    sock.send(frame) catch |err| log.warn("send {f} to {x}: {t}", .{ f.msg_type, f.dst, err });
 }
 
 /// Raw IEEE 1905 frames on one interface (normally the LAN bridge).
@@ -428,7 +428,7 @@ fn steerOnce(io: Io, sock: PacketSocket, s: Settings, args: []const []const u8) 
     try sock.send(try cmdu.build(&tx, agent, sock.mac, .client_steering_request, mid, &.{
         .{ .type = .steering_request, .value = &req },
     }));
-    log.info("asked agent {x} to move {x} to {x}", .{ agent, sta, to });
+    log.info("asked agent {x} to move {x} to {x} (mid {d})", .{ agent, sta, to, mid });
 }
 
 /// "aa:bb:cc:dd:ee:ff", either case.

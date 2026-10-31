@@ -36,7 +36,19 @@ pub const MsgType = enum(u16) {
     client_steering_btm_report = 0x8015,
     steering_completed = 0x8017,
     _,
+
+    /// For `{f}`: agents send types we don't name, and `{t}` panics on those.
+    pub fn format(t: MsgType, w: *Io.Writer) Io.Writer.Error!void {
+        if (std.enums.tagName(MsgType, t)) |name| return w.writeAll(name);
+        try w.print("0x{x:0>4}", .{@backingInt(t)});
+    }
 };
+
+test "unnamed message types print as hex" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("0x8006", try std.fmt.bufPrint(&buf, "{f}", .{@as(MsgType, @fromBackingInt(0x8006))}));
+    try testing.expectEqualStrings("ack", try std.fmt.bufPrint(&buf, "{f}", .{MsgType.ack}));
+}
 
 pub const Tlv = enum(u8) {
     end = 0x00,
